@@ -16,6 +16,14 @@ android {
     }
 
     buildTypes {
+        // The GitHub build makes the "debug" APK. Normally that one is slow and jerky.
+        // These settings make it a fast, smaller build while keeping the same install steps.
+        debug {
+            isDebuggable = false
+            isMinifyEnabled = true
+            isShrinkResources = true
+            proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
+        }
         release {
             isMinifyEnabled = false
         }

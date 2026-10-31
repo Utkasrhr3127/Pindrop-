@@ -33,6 +33,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -151,7 +152,7 @@ fun ShareSheet(uris: List<Uri>, onClose: () -> Unit) {
                 .fillMaxWidth()
                 .clip(shape)
                 .background(Color(0xFF0D1118))
-                .border(2.dp, Steel, shape)
+                .border(1.dp, Line, shape)
                 .navigationBarsPadding()
                 .padding(horizontal = 22.dp, vertical = 16.dp),
             horizontalAlignment = Alignment.CenterHorizontally
@@ -174,7 +175,7 @@ fun ShareSheet(uris: List<Uri>, onClose: () -> Unit) {
                 align = TextAlign.Center
             )
             Spacer(Modifier.height(6.dp))
-            Px(sub, size = 12.sp, color = Muted, align = TextAlign.Center, maxLines = 3)
+            Body(sub, size = 13.sp, color = Muted, align = TextAlign.Center, maxLines = 3)
             Spacer(Modifier.height(18.dp))
 
             if (picking) {
@@ -192,7 +193,7 @@ fun ShareSheet(uris: List<Uri>, onClose: () -> Unit) {
                         .clickable { onClose() }
                         .padding(horizontal = 18.dp, vertical = 8.dp)
                 ) {
-                    Px("Cancel", size = 13.sp, color = Muted, bold = true)
+                    Body("Cancel", size = 14.sp, color = Muted, weight = FontWeight.Medium)
                 }
             } else if (shownError == null) {
                 PixelBar(if (finished) 1f else overall)
@@ -204,7 +205,7 @@ fun ShareSheet(uris: List<Uri>, onClose: () -> Unit) {
                             .clickable { onClose() }
                             .padding(horizontal = 18.dp, vertical = 8.dp)
                     ) {
-                        Px("Cancel", size = 13.sp, color = Muted, bold = true)
+                        Body("Cancel", size = 14.sp, color = Muted, weight = FontWeight.Medium)
                     }
                 }
             } else {

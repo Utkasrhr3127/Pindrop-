@@ -52,8 +52,9 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 
 val Bg = Color(0xFF0A0C11)
-val PanelBg = Color(0xD90C1017)
-val Steel = Color(0xFF3A4558)
+val PanelBg = Color(0xFF11151D)
+val Steel = Color(0x26FFFFFF)
+val Line = Color(0x1AFFFFFF)
 val SteelDim = Color(0xFF2A3242)
 val Cream = Color(0xFFF3EAD9)
 val CreamShade = Color(0xFFE2D2BC)
@@ -221,27 +222,27 @@ fun Wordmark(width: Dp, modifier: Modifier = Modifier) {
 
 @Composable
 fun StatusPill(text: String, dot: Color) {
-    val shape = RoundedCornerShape(12.dp)
+    val shape = RoundedCornerShape(50)
     Row(
         Modifier
             .clip(shape)
-            .background(PanelBg)
-            .border(1.5.dp, Steel, shape)
+            .background(Color(0x0FFFFFFF))
+            .border(1.dp, Line, shape)
             .padding(horizontal = 14.dp, vertical = 8.dp),
         verticalAlignment = Alignment.CenterVertically
     ) {
         Box(
             Modifier
-                .size(9.dp)
+                .size(8.dp)
                 .clip(CircleShape)
                 .background(dot)
         )
         Spacer(Modifier.width(8.dp))
-        Body(text, size = 13.sp, weight = FontWeight.Medium, spacing = 0.4.sp)
+        Body(text, size = 13.sp, weight = FontWeight.Medium, spacing = 0.sp)
     }
 }
 
-/** A glass-like panel with a pixel heading. Give it onHeaderClick to make the heading tappable. */
+/** A flat dark card with a small pixel heading. Give it onHeaderClick to make the heading tappable. */
 @Composable
 fun PixelCard(
     title: String,
@@ -251,14 +252,14 @@ fun PixelCard(
     onHeaderClick: (() -> Unit)? = null,
     content: @Composable ColumnScope.() -> Unit
 ) {
-    val shape = RoundedCornerShape(18.dp)
+    val shape = RoundedCornerShape(22.dp)
     Column(
         modifier
             .fillMaxWidth()
             .clip(shape)
             .background(PanelBg)
-            .border(1.5.dp, Steel, shape)
-            .padding(16.dp)
+            .border(1.dp, Line, shape)
+            .padding(18.dp)
     ) {
         Row(
             Modifier
@@ -266,33 +267,34 @@ fun PixelCard(
                 .then(if (onHeaderClick != null) Modifier.clickable(onClick = onHeaderClick) else Modifier),
             verticalAlignment = Alignment.CenterVertically
         ) {
-            PxIcon(icon, Orange, 3.dp)
+            Box(
+                Modifier
+                    .size(34.dp)
+                    .clip(RoundedCornerShape(10.dp))
+                    .background(Color(0x1FFF5A1F)),
+                contentAlignment = Alignment.Center
+            ) {
+                PxIcon(icon, Orange, 2.dp)
+            }
             Spacer(Modifier.width(12.dp))
-            Px(title, modifier = Modifier.weight(1f), size = 13.sp, bold = true, spacing = 1.5.sp)
+            Px(title, modifier = Modifier.weight(1f), size = 12.sp, bold = true, spacing = 1.5.sp)
             if (trailing != null) trailing()
         }
-        Spacer(Modifier.height(14.dp))
+        Spacer(Modifier.height(16.dp))
         content()
     }
 }
 
+/** A soft rounded box for empty messages and text fields. */
 @Composable
 fun DashedBox(modifier: Modifier = Modifier, content: @Composable BoxScope.() -> Unit) {
+    val shape = RoundedCornerShape(14.dp)
     Box(
         modifier
-            .drawBehind {
-                val sw = 1.5.dp.toPx()
-                drawRoundRect(
-                    color = SteelDim,
-                    topLeft = Offset(sw / 2, sw / 2),
-                    size = Size(size.width - sw, size.height - sw),
-                    cornerRadius = CornerRadius(8.dp.toPx()),
-                    style = Stroke(
-                        width = sw,
-                        pathEffect = PathEffect.dashPathEffect(floatArrayOf(8.dp.toPx(), 6.dp.toPx()))
-                    )
-                )
-            }
+            .fillMaxWidth()
+            .clip(shape)
+            .background(Color(0x08FFFFFF))
+            .border(1.dp, Line, shape)
             .padding(14.dp),
         content = content
     )
@@ -308,12 +310,12 @@ fun PxButton(
     compact: Boolean = false,
     onClick: () -> Unit
 ) {
-    val shape = RoundedCornerShape(12.dp)
+    val shape = RoundedCornerShape(14.dp)
     val fg = if (filled) Ink else Cream
     val base = if (filled) {
         Modifier.background(Brush.verticalGradient(listOf(Color(0xFFFF7A3A), OrangeDeep)), shape)
     } else {
-        Modifier.background(Color(0x14FFFFFF), shape).border(1.5.dp, Steel, shape)
+        Modifier.background(Color(0x0FFFFFFF), shape).border(1.dp, Line, shape)
     }
     Box(
         modifier
@@ -330,7 +332,7 @@ fun PxButton(
                 PxIcon(icon, fg, if (compact) 2.dp else 3.dp)
                 Spacer(Modifier.width(if (compact) 8.dp else 10.dp))
             }
-            Body(label, size = if (compact) 13.sp else 15.sp, color = fg, weight = FontWeight.SemiBold, spacing = 0.3.sp, maxLines = 1)
+            Body(label, size = if (compact) 13.sp else 15.sp, color = fg, weight = FontWeight.SemiBold, spacing = 0.sp, maxLines = 1)
         }
     }
 }
@@ -338,13 +340,13 @@ fun PxButton(
 /** Small square button with just an icon. */
 @Composable
 fun SquareButton(icon: List<String>, onClick: () -> Unit) {
-    val shape = RoundedCornerShape(12.dp)
+    val shape = RoundedCornerShape(14.dp)
     Box(
         Modifier
             .size(52.dp)
             .clip(shape)
-            .background(Color(0x14FFFFFF), shape)
-            .border(1.5.dp, Steel, shape)
+            .background(Color(0x0FFFFFFF), shape)
+            .border(1.dp, Line, shape)
             .clickable(onClick = onClick),
         contentAlignment = Alignment.Center
     ) {
@@ -358,7 +360,7 @@ fun HelpButton(onClick: () -> Unit) {
         Modifier
             .size(28.dp)
             .clip(CircleShape)
-            .border(1.5.dp, Steel, CircleShape)
+            .border(1.dp, Line, CircleShape)
             .clickable(onClick = onClick),
         contentAlignment = Alignment.Center
     ) {
@@ -366,50 +368,44 @@ fun HelpButton(onClick: () -> Unit) {
     }
 }
 
-/** Chunky progress bar made of little blocks. */
+/** Smooth rounded progress bar. */
 @Composable
 fun PixelBar(fraction: Float, modifier: Modifier = Modifier) {
     val f by animateFloatAsState(fraction.coerceIn(0f, 1f), label = "bar")
     Canvas(
         modifier
             .fillMaxWidth()
-            .height(12.dp)
+            .height(8.dp)
     ) {
-        val n = 24
-        val gap = 3.dp.toPx()
-        val cw = (size.width - gap * (n - 1)) / n
-        val filled = (f * n + 0.5f).toInt()
-        for (i in 0 until n) {
-            drawRect(
-                color = if (i < filled) Orange else SteelDim,
-                topLeft = Offset(i * (cw + gap), 0f),
-                size = Size(cw, size.height)
-            )
+        val r = CornerRadius(size.height / 2)
+        drawRoundRect(color = SteelDim, cornerRadius = r)
+        if (f > 0f) {
+            drawRoundRect(color = Orange, size = Size(size.width * f, size.height), cornerRadius = r)
         }
     }
 }
 
 @Composable
 fun TagPill(text: String, color: Color = Cream, border: Color = Steel) {
-    val shape = RoundedCornerShape(8.dp)
+    val shape = RoundedCornerShape(50)
     Box(
         Modifier
             .clip(shape)
-            .border(1.5.dp, border, shape)
-            .padding(horizontal = 9.dp, vertical = 3.dp)
+            .border(1.dp, border, shape)
+            .padding(horizontal = 10.dp, vertical = 3.dp)
     ) {
-        Body(text, size = 11.sp, color = color, weight = FontWeight.Medium, spacing = 0.5.sp)
+        Body(text, size = 11.sp, color = color, weight = FontWeight.Medium, spacing = 0.3.sp)
     }
 }
 
-/** Draws a QR code made by [Qr]. Light background and dark squares so cameras can read it. */
+/** Draws a QR code made by [Qr]. White background and dark squares so cameras can read it. */
 @Composable
 fun QrView(modules: Array<BooleanArray>, dimension: Dp = 220.dp) {
     Canvas(
         Modifier
             .size(dimension)
-            .clip(RoundedCornerShape(14.dp))
-            .background(Cream)
+            .clip(RoundedCornerShape(16.dp))
+            .background(Color.White)
     ) {
         val n = modules.size
         val quiet = 3
