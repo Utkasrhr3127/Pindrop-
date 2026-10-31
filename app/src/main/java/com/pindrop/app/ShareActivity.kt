@@ -59,6 +59,16 @@ fun extractUris(i: Intent): List<Uri> = when (i.action) {
 @Composable
 fun ShareSheet(uris: List<Uri>, onClose: () -> Unit) {
     val ctx = LocalContext.current
+
+    // Places this file can go: the laptop (if its address is saved) and every paired phone.
+    val choices = remember {
+        val list = mutableListOf<Target>()
+        if (Prefs.getAddr(ctx).isNotBlank()) list.add(laptopTarget(ctx))
+        Peers.list(ctx).forEach { list.add(it.target()) }
+        list.toList()
+    }
+    var chosen by remember { mutableStateOf<Target?>(if (choices.size == 1) choices[0] else null) }
+
     var attempt by remember { mutableIntStateOf(0) }
     var doneCount by remember { mutableIntStateOf(0) }
     var currentFraction by remember { mutableFloatStateOf(0f) }
@@ -66,20 +76,19 @@ fun ShareSheet(uris: List<Uri>, onClose: () -> Unit) {
     var error by remember { mutableStateOf<String?>(null) }
     var finished by remember { mutableStateOf(false) }
 
-    LaunchedEffect(attempt) {
+    val setupError: String? = when {
+        choices.isEmpty() -> "Add your laptop address or pair a phone first. Open the Pindrop app."
+        uris.isEmpty() -> "Nothing to send. Share a photo, video or file."
+        else -> null
+    }
+
+    LaunchedEffect(attempt, chosen) {
+        val target = chosen ?: return@LaunchedEffect
         error = null
         finished = false
         doneCount = 0
         currentFraction = 0f
-        val addr = Prefs.getAddr(ctx)
-        if (addr.isBlank()) {
-            error = "Add your laptop address first. Open the Pindrop app."
-            return@LaunchedEffect
-        }
-        if (uris.isEmpty()) {
-            error = "Nothing to send. Share a photo, video or file."
-            return@LaunchedEffect
-        }
+        if (uris.isEmpty()) return@LaunchedEffect
         try {
             withContext(Dispatchers.IO) {
                 for ((i, uri) in uris.withIndex()) {
@@ -87,7 +96,7 @@ fun ShareSheet(uris: List<Uri>, onClose: () -> Unit) {
                     currentName = info.name
                     currentFraction = 0f
                     try {
-                        Net.upload(addr, info) { sent ->
+                        Net.upload(target.addr, info, target.key) { sent ->
                             currentFraction = if (info.size > 0) sent.toFloat() / info.size.toFloat() else 0f
                         }
                     } finally {
@@ -102,25 +111,31 @@ fun ShareSheet(uris: List<Uri>, onClose: () -> Unit) {
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
-            error = Net.friendly(e)
+            error = Net.friendly(e, whoName(target))
         }
     }
 
+    val shownError: String? = error ?: setupError
+    val picking = chosen == null && shownError == null
     val total = uris.size.coerceAtLeast(1)
     val overall = ((doneCount + currentFraction) / total).coerceIn(0f, 1f)
     val mood = when {
-        error != null -> Mood.ERROR
+        shownError != null -> Mood.ERROR
         finished -> Mood.DONE
+        picking -> Mood.IDLE
         else -> Mood.BUSY
     }
     val title = when {
-        error != null -> "Couldn't send"
+        shownError != null -> "Couldn't send"
         finished -> "Dropped!"
+        picking -> "Send to..."
         else -> "Dropping..."
     }
+    val placeName = chosen?.let { whoName(it) } ?: "your laptop"
     val sub = when {
-        error != null -> error ?: ""
-        finished -> if (uris.size == 1) "Saved in Downloads/Pindrop on your laptop." else "${uris.size} files are on your laptop."
+        shownError != null -> shownError
+        picking -> if (uris.size == 1) "1 file" else "${uris.size} files"
+        finished -> if (uris.size == 1) "Saved in Downloads/Pindrop on $placeName." else "${uris.size} files are on $placeName."
         else -> currentName + if (uris.size > 1) "  (${doneCount + 1} of ${uris.size})" else ""
     }
 
@@ -155,14 +170,31 @@ fun ShareSheet(uris: List<Uri>, onClose: () -> Unit) {
                 title,
                 size = 22.sp,
                 bold = true,
-                color = if (error != null) RedErr else Cream,
+                color = if (shownError != null) RedErr else Cream,
                 align = TextAlign.Center
             )
             Spacer(Modifier.height(6.dp))
             Px(sub, size = 12.sp, color = Muted, align = TextAlign.Center, maxLines = 3)
             Spacer(Modifier.height(18.dp))
 
-            if (error == null) {
+            if (picking) {
+                choices.forEach { t ->
+                    PxButton(
+                        t.name,
+                        Modifier.fillMaxWidth(),
+                        icon = if (t.key == null) PixelData.ICON_LAPTOP else PixelData.ICON_PHONE
+                    ) { chosen = t }
+                    Spacer(Modifier.height(10.dp))
+                }
+                Box(
+                    Modifier
+                        .clip(RoundedCornerShape(8.dp))
+                        .clickable { onClose() }
+                        .padding(horizontal = 18.dp, vertical = 8.dp)
+                ) {
+                    Px("Cancel", size = 13.sp, color = Muted, bold = true)
+                }
+            } else if (shownError == null) {
                 PixelBar(if (finished) 1f else overall)
                 if (!finished) {
                     Spacer(Modifier.height(14.dp))
@@ -177,7 +209,9 @@ fun ShareSheet(uris: List<Uri>, onClose: () -> Unit) {
                 }
             } else {
                 Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                    PxButton("Try again", Modifier.weight(1f)) { attempt++ }
+                    if (setupError == null) {
+                        PxButton("Try again", Modifier.weight(1f)) { attempt++ }
+                    }
                     PxButton("Close", Modifier.weight(1f), filled = false) { onClose() }
                 }
             }

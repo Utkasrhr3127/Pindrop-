@@ -24,7 +24,7 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.material3.Text
+import androidx.compose.foundation.text.BasicText
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.ui.Alignment
@@ -40,6 +40,7 @@ import androidx.compose.ui.graphics.PathEffect
 import androidx.compose.ui.graphics.drawscope.DrawScope
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.Font
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
@@ -51,8 +52,8 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 
 val Bg = Color(0xFF0A0C11)
-val PanelBg = Color(0xE60D1118)
-val Steel = Color(0xFF3A4457)
+val PanelBg = Color(0xD90C1017)
+val Steel = Color(0xFF3A4558)
 val SteelDim = Color(0xFF2A3242)
 val Cream = Color(0xFFF3EAD9)
 val CreamShade = Color(0xFFE2D2BC)
@@ -62,6 +63,7 @@ val OrangeDeep = Color(0xFFE6460E)
 val Ink = Color(0xFF14110D)
 val RedErr = Color(0xFFFF3B30)
 
+/** Pixel font: headings, the wordmark and the address digits. Everything else uses the phone's own font. */
 val PixelFont = FontFamily(
     Font(R.font.pixel_regular, FontWeight.Normal),
     Font(R.font.pixel_bold, FontWeight.Bold)
@@ -69,7 +71,7 @@ val PixelFont = FontFamily(
 
 enum class Mood { IDLE, BUSY, DONE, ERROR }
 
-/** All text in Pindrop goes through here: pixel font, capital letters. */
+/** Pixel heading text, always in capitals. */
 @Composable
 fun Px(
     text: String,
@@ -81,18 +83,48 @@ fun Px(
     spacing: TextUnit = 1.sp,
     maxLines: Int = Int.MAX_VALUE
 ) {
-    Text(
+    BasicText(
         text = text.uppercase(),
         modifier = modifier,
-        color = color,
-        fontSize = size,
-        fontFamily = PixelFont,
-        fontWeight = if (bold) FontWeight.Bold else FontWeight.Normal,
-        letterSpacing = spacing,
-        textAlign = align,
-        maxLines = maxLines,
+        style = TextStyle(
+            color = color,
+            fontSize = size,
+            fontFamily = PixelFont,
+            fontWeight = if (bold) FontWeight.Bold else FontWeight.Normal,
+            letterSpacing = spacing,
+            textAlign = align ?: TextAlign.Unspecified,
+            lineHeight = size * 1.35f
+        ),
         overflow = TextOverflow.Ellipsis,
-        lineHeight = size * 1.35f
+        maxLines = maxLines
+    )
+}
+
+/** Everyday text: clean, light and quiet, in the phone's own font. */
+@Composable
+fun Body(
+    text: String,
+    modifier: Modifier = Modifier,
+    size: TextUnit = 14.sp,
+    color: Color = Cream,
+    weight: FontWeight = FontWeight.Normal,
+    align: TextAlign? = null,
+    spacing: TextUnit = 0.2.sp,
+    maxLines: Int = Int.MAX_VALUE
+) {
+    BasicText(
+        text = text,
+        modifier = modifier,
+        style = TextStyle(
+            color = color,
+            fontSize = size,
+            fontWeight = weight,
+            letterSpacing = spacing,
+            textAlign = align ?: TextAlign.Unspecified,
+            lineHeight = size * 1.4f
+        ),
+        overflow = TextOverflow.Ellipsis,
+        maxLines = maxLines
     )
 }
 
@@ -189,46 +221,55 @@ fun Wordmark(width: Dp, modifier: Modifier = Modifier) {
 
 @Composable
 fun StatusPill(text: String, dot: Color) {
-    val shape = RoundedCornerShape(10.dp)
+    val shape = RoundedCornerShape(12.dp)
     Row(
         Modifier
             .clip(shape)
             .background(PanelBg)
-            .border(2.dp, Steel, shape)
-            .padding(horizontal = 12.dp, vertical = 8.dp),
+            .border(1.5.dp, Steel, shape)
+            .padding(horizontal = 14.dp, vertical = 8.dp),
         verticalAlignment = Alignment.CenterVertically
     ) {
         Box(
             Modifier
-                .size(10.dp)
+                .size(9.dp)
                 .clip(CircleShape)
                 .background(dot)
         )
         Spacer(Modifier.width(8.dp))
-        Px(text, size = 13.sp, bold = true)
+        Body(text, size = 13.sp, weight = FontWeight.Medium, spacing = 0.4.sp)
     }
 }
 
+/** A glass-like panel with a pixel heading. Give it onHeaderClick to make the heading tappable. */
 @Composable
 fun PixelCard(
     title: String,
     icon: List<String>,
     modifier: Modifier = Modifier,
+    trailing: (@Composable () -> Unit)? = null,
+    onHeaderClick: (() -> Unit)? = null,
     content: @Composable ColumnScope.() -> Unit
 ) {
-    val shape = RoundedCornerShape(14.dp)
+    val shape = RoundedCornerShape(18.dp)
     Column(
         modifier
             .fillMaxWidth()
             .clip(shape)
             .background(PanelBg)
-            .border(2.dp, Steel, shape)
+            .border(1.5.dp, Steel, shape)
             .padding(16.dp)
     ) {
-        Row(verticalAlignment = Alignment.CenterVertically) {
+        Row(
+            Modifier
+                .fillMaxWidth()
+                .then(if (onHeaderClick != null) Modifier.clickable(onClick = onHeaderClick) else Modifier),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
             PxIcon(icon, Orange, 3.dp)
             Spacer(Modifier.width(12.dp))
-            Px(title, size = 15.sp, bold = true)
+            Px(title, modifier = Modifier.weight(1f), size = 13.sp, bold = true, spacing = 1.5.sp)
+            if (trailing != null) trailing()
         }
         Spacer(Modifier.height(14.dp))
         content()
@@ -239,17 +280,16 @@ fun PixelCard(
 fun DashedBox(modifier: Modifier = Modifier, content: @Composable BoxScope.() -> Unit) {
     Box(
         modifier
-            .fillMaxWidth()
             .drawBehind {
-                val sw = 2.dp.toPx()
+                val sw = 1.5.dp.toPx()
                 drawRoundRect(
                     color = SteelDim,
                     topLeft = Offset(sw / 2, sw / 2),
                     size = Size(size.width - sw, size.height - sw),
-                    cornerRadius = CornerRadius(4.dp.toPx()),
+                    cornerRadius = CornerRadius(8.dp.toPx()),
                     style = Stroke(
                         width = sw,
-                        pathEffect = PathEffect.dashPathEffect(floatArrayOf(10.dp.toPx(), 7.dp.toPx()))
+                        pathEffect = PathEffect.dashPathEffect(floatArrayOf(8.dp.toPx(), 6.dp.toPx()))
                     )
                 )
             }
@@ -268,16 +308,16 @@ fun PxButton(
     compact: Boolean = false,
     onClick: () -> Unit
 ) {
-    val shape = RoundedCornerShape(10.dp)
+    val shape = RoundedCornerShape(12.dp)
     val fg = if (filled) Ink else Cream
     val base = if (filled) {
-        Modifier.background(Brush.verticalGradient(listOf(Color(0xFFFF6A2A), OrangeDeep)), shape)
+        Modifier.background(Brush.verticalGradient(listOf(Color(0xFFFF7A3A), OrangeDeep)), shape)
     } else {
-        Modifier.background(Color.Transparent, shape).border(2.dp, Steel, shape)
+        Modifier.background(Color(0x14FFFFFF), shape).border(1.5.dp, Steel, shape)
     }
     Box(
         modifier
-            .height(if (compact) 40.dp else 54.dp)
+            .height(if (compact) 40.dp else 52.dp)
             .clip(shape)
             .then(base)
             .clickable(enabled = enabled, onClick = onClick)
@@ -288,10 +328,41 @@ fun PxButton(
         Row(verticalAlignment = Alignment.CenterVertically) {
             if (icon != null) {
                 PxIcon(icon, fg, if (compact) 2.dp else 3.dp)
-                Spacer(Modifier.width(if (compact) 8.dp else 12.dp))
+                Spacer(Modifier.width(if (compact) 8.dp else 10.dp))
             }
-            Px(label, size = if (compact) 13.sp else 15.sp, color = fg, bold = true)
+            Body(label, size = if (compact) 13.sp else 15.sp, color = fg, weight = FontWeight.SemiBold, spacing = 0.3.sp, maxLines = 1)
         }
+    }
+}
+
+/** Small square button with just an icon. */
+@Composable
+fun SquareButton(icon: List<String>, onClick: () -> Unit) {
+    val shape = RoundedCornerShape(12.dp)
+    Box(
+        Modifier
+            .size(52.dp)
+            .clip(shape)
+            .background(Color(0x14FFFFFF), shape)
+            .border(1.5.dp, Steel, shape)
+            .clickable(onClick = onClick),
+        contentAlignment = Alignment.Center
+    ) {
+        PxIcon(icon, Cream, 2.dp)
+    }
+}
+
+@Composable
+fun HelpButton(onClick: () -> Unit) {
+    Box(
+        Modifier
+            .size(28.dp)
+            .clip(CircleShape)
+            .border(1.5.dp, Steel, CircleShape)
+            .clickable(onClick = onClick),
+        contentAlignment = Alignment.Center
+    ) {
+        Px("?", size = 11.sp, color = Muted, bold = true)
     }
 }
 
@@ -302,7 +373,7 @@ fun PixelBar(fraction: Float, modifier: Modifier = Modifier) {
     Canvas(
         modifier
             .fillMaxWidth()
-            .height(14.dp)
+            .height(12.dp)
     ) {
         val n = 24
         val gap = 3.dp.toPx()
@@ -320,13 +391,39 @@ fun PixelBar(fraction: Float, modifier: Modifier = Modifier) {
 
 @Composable
 fun TagPill(text: String, color: Color = Cream, border: Color = Steel) {
-    val shape = RoundedCornerShape(6.dp)
+    val shape = RoundedCornerShape(8.dp)
     Box(
         Modifier
             .clip(shape)
-            .border(2.dp, border, shape)
-            .padding(horizontal = 8.dp, vertical = 2.dp)
+            .border(1.5.dp, border, shape)
+            .padding(horizontal = 9.dp, vertical = 3.dp)
     ) {
-        Px(text, size = 11.sp, color = color, bold = true)
+        Body(text, size = 11.sp, color = color, weight = FontWeight.Medium, spacing = 0.5.sp)
+    }
+}
+
+/** Draws a QR code made by [Qr]. Light background and dark squares so cameras can read it. */
+@Composable
+fun QrView(modules: Array<BooleanArray>, dimension: Dp = 220.dp) {
+    Canvas(
+        Modifier
+            .size(dimension)
+            .clip(RoundedCornerShape(14.dp))
+            .background(Cream)
+    ) {
+        val n = modules.size
+        val quiet = 3
+        val cell = size.width / (n + quiet * 2)
+        for (y in 0 until n) {
+            for (x in 0 until n) {
+                if (modules[y][x]) {
+                    drawRect(
+                        color = Ink,
+                        topLeft = Offset((x + quiet) * cell, (y + quiet) * cell),
+                        size = Size(cell + 0.5f, cell + 0.5f)
+                    )
+                }
+            }
+        }
     }
 }

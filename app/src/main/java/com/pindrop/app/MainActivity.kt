@@ -8,6 +8,9 @@ import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -20,10 +23,12 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
@@ -35,20 +40,25 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.FilterQuality
 import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.imageResource
 import androidx.compose.ui.res.painterResource
+import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.journeyapps.barcodescanner.ScanContract
+import com.journeyapps.barcodescanner.ScanOptions
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -67,10 +77,38 @@ class Transfer(val name: String, val doneLabel: String) {
     var note by mutableStateOf("")
 }
 
+/** "your laptop" or the phone's name, for messages. */
+fun whoName(t: Target): String = if (t.key == null) "your laptop" else t.name
+
+/** A paired phone as a place to send files. */
+fun Peer.target(): Target = Target(name, addr, Secure.unb64(key))
+
+@Composable
+fun TargetChip(label: String, selected: Boolean, onClick: () -> Unit) {
+    val shape = RoundedCornerShape(10.dp)
+    Box(
+        Modifier
+            .clip(shape)
+            .background(if (selected) Orange else Color(0x14FFFFFF), shape)
+            .border(1.5.dp, if (selected) Orange else Steel, shape)
+            .clickable(onClick = onClick)
+            .padding(horizontal = 14.dp, vertical = 9.dp)
+    ) {
+        Body(
+            label,
+            size = 13.sp,
+            color = if (selected) Ink else Cream,
+            weight = FontWeight.SemiBold,
+            maxLines = 1
+        )
+    }
+}
+
 @Composable
 fun HomeScreen() {
     val ctx = LocalContext.current
     val scope = rememberCoroutineScope()
+    val clipboard = LocalClipboardManager.current
 
     var addr by remember { mutableStateOf(Prefs.getAddr(ctx)) }
     var kind by remember { mutableIntStateOf(0) } // 0 not tested, 1 connected, 2 failed, 3 checking
@@ -80,11 +118,73 @@ fun HomeScreen() {
     var checking by remember { mutableStateOf(false) }
     var waitingMsg by remember { mutableStateOf("") }
 
+    // phone-to-phone
+    val peers = remember { mutableStateListOf<Peer>().apply { addAll(Peers.list(ctx)) } }
+    var selected by remember { mutableStateOf("laptop") } // "laptop" or the key of a paired phone
+    var myIp by remember { mutableStateOf<String?>(null) }
+    var myPort by remember { mutableIntStateOf(0) }
+    var pairMsg by remember { mutableStateOf("") }
+    var pasted by remember { mutableStateOf("") }
+
     val mood = when {
         kind == 2 -> Mood.ERROR
         kind == 3 || checking -> Mood.BUSY
         kind == 1 -> Mood.DONE
         else -> Mood.IDLE
+    }
+
+    fun refreshPeers() {
+        peers.clear()
+        peers.addAll(Peers.list(ctx))
+    }
+
+    fun refreshAddress() {
+        myPort = PhoneServer.port
+        myIp = Peers.localIp()
+    }
+
+    fun currentTarget(): Target? {
+        if (selected == "laptop") {
+            return if (addr.isBlank()) null else Target("Laptop", addr, null)
+        }
+        return peers.firstOrNull { it.key == selected }?.target()
+    }
+
+    // This phone listens for files from other phones while the app is open.
+    DisposableEffect(Unit) {
+        PhoneServer.listener = { what, name, size ->
+            scope.launch {
+                if (what == "pair") {
+                    refreshPeers()
+                    pairMsg = name + " paired with you."
+                } else {
+                    val t = Transfer(name, "RECEIVED")
+                    t.fraction = 1f
+                    t.state = "RECEIVED"
+                    t.note = "In Downloads/Pindrop (" + fmtSize(size) + ")"
+                    transfers.add(0, t)
+                }
+            }
+        }
+        PhoneServer.start(ctx)
+        refreshAddress()
+        onDispose {
+            PhoneServer.listener = null
+            PhoneServer.stop()
+        }
+    }
+
+    val qr: Array<BooleanArray>? = remember(myIp, myPort) {
+        val ip = myIp
+        if (ip == null || myPort <= 0) {
+            null
+        } else {
+            try {
+                Qr.encode(Peers.pairingUri(ctx, ip, myPort))
+            } catch (e: Exception) {
+                null
+            }
+        }
     }
 
     suspend fun loadWaiting() {
@@ -106,7 +206,7 @@ fun HomeScreen() {
         checking = false
     }
 
-    fun sendUri(uri: Uri) {
+    fun sendUri(uri: Uri, target: Target) {
         scope.launch {
             val info = try {
                 withContext(Dispatchers.IO) { fileInfo(ctx, uri) }
@@ -121,10 +221,11 @@ fun HomeScreen() {
                 return@launch
             }
             val t = Transfer(info.name, "SENT")
+            t.note = "To " + target.name
             transfers.add(0, t)
             try {
                 withContext(Dispatchers.IO) {
-                    Net.upload(addr, info) { sent ->
+                    Net.upload(target.addr, info, target.key) { sent ->
                         t.fraction = if (info.size > 0) sent.toFloat() / info.size.toFloat() else 0f
                     }
                 }
@@ -132,7 +233,7 @@ fun HomeScreen() {
                 t.state = "SENT"
             } catch (e: Exception) {
                 t.state = "FAILED"
-                t.note = Net.friendly(e)
+                t.note = Net.friendly(e, whoName(target))
             } finally {
                 info.release()
             }
@@ -161,11 +262,62 @@ fun HomeScreen() {
         }
     }
 
+    fun addPeerFromCode(raw: String) {
+        val p = Peers.parse(raw)
+        if (p == null) {
+            pairMsg = "That isn't a Pindrop code."
+            return
+        }
+        if (myPort <= 0) {
+            pairMsg = "This phone isn't ready yet. Tap Refresh, then try again."
+            return
+        }
+        pairMsg = "Pairing with " + p.name + "..."
+        scope.launch {
+            try {
+                withContext(Dispatchers.IO) { Net.pair(p, Peers.myName(), myPort, Prefs.getKey(ctx)) }
+                Peers.add(ctx, p)
+                refreshPeers()
+                selected = p.key
+                pasted = ""
+                pairMsg = "Paired with " + p.name + ". Now choose files to send."
+            } catch (e: Exception) {
+                pairMsg = Net.friendly(e, p.name)
+            }
+        }
+    }
+
+    fun testPeer(p: Peer) {
+        scope.launch {
+            pairMsg = "Checking " + p.name + "..."
+            val ok = withContext(Dispatchers.IO) { Net.ping(p.addr, Secure.unb64(p.key)) }
+            pairMsg = if (ok) {
+                p.name + " is ready."
+            } else {
+                "Can't reach " + p.name + ". Open Pindrop there, or scan its code again."
+            }
+        }
+    }
+
+    fun removePeer(p: Peer) {
+        Peers.remove(ctx, p)
+        refreshPeers()
+        if (selected == p.key) selected = "laptop"
+    }
+
     val picker = rememberLauncherForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) { uris ->
         if (uris.isNotEmpty()) {
-            Prefs.setAddr(ctx, addr)
-            uris.forEach { sendUri(it) }
+            val target = currentTarget()
+            if (target != null) {
+                if (target.key == null) Prefs.setAddr(ctx, addr)
+                uris.forEach { sendUri(it, target) }
+            }
         }
+    }
+
+    val scanner = rememberLauncherForActivityResult(ScanContract()) { result ->
+        val text = result.contents
+        if (text != null) addPeerFromCode(text)
     }
 
     LaunchedEffect(Unit) {
@@ -206,10 +358,10 @@ fun HomeScreen() {
                     modifier = Modifier.size(38.dp)
                 )
                 when (kind) {
-                    1 -> StatusPill("Connected", Orange)
-                    2 -> StatusPill("Can't reach", RedErr)
+                    1 -> StatusPill("Laptop connected", Orange)
+                    2 -> StatusPill("Can't reach laptop", RedErr)
                     3 -> StatusPill("Checking", Muted)
-                    else -> StatusPill("Not tested", Muted)
+                    else -> StatusPill("Laptop not tested", Muted)
                 }
             }
 
@@ -219,9 +371,48 @@ fun HomeScreen() {
                 Spacer(Modifier.height(6.dp))
                 Wordmark(width = 300.dp)
                 Spacer(Modifier.height(10.dp))
-                Px("Send files to your laptop", size = 12.sp, color = Muted, spacing = 3.sp, align = TextAlign.Center)
+                Px(
+                    "Send files to your laptop or a friend's phone",
+                    size = 12.sp,
+                    color = Muted,
+                    spacing = 2.sp,
+                    align = TextAlign.Center
+                )
             }
             Spacer(Modifier.height(24.dp))
+
+            // send
+            PixelCard("Send files", PixelData.ICON_UP) {
+                Px("Send to", size = 11.sp, color = Muted)
+                Spacer(Modifier.height(8.dp))
+                Row(
+                    Modifier.horizontalScroll(rememberScrollState()),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    TargetChip("Laptop", selected == "laptop") { selected = "laptop" }
+                    peers.forEach { p ->
+                        TargetChip(p.name, selected == p.key) { selected = p.key }
+                    }
+                }
+                Spacer(Modifier.height(14.dp))
+                PxButton(
+                    "Choose files",
+                    Modifier.fillMaxWidth(),
+                    icon = PixelData.ICON_UP,
+                    enabled = currentTarget() != null
+                ) { picker.launch(arrayOf("*/*")) }
+                Spacer(Modifier.height(10.dp))
+                Px(
+                    if (selected == "laptop" && addr.isBlank()) {
+                        "Type your laptop's address below first."
+                    } else {
+                        "Or open any photo or file, tap Share, then pick Pindrop."
+                    },
+                    size = 12.sp,
+                    color = Muted
+                )
+            }
+            Spacer(Modifier.height(14.dp))
 
             // address
             PixelCard("Your laptop's address", PixelData.ICON_LAPTOP) {
@@ -286,20 +477,7 @@ fun HomeScreen() {
             }
             Spacer(Modifier.height(14.dp))
 
-            // send
-            PixelCard("Send to laptop", PixelData.ICON_UP) {
-                PxButton(
-                    "Choose files",
-                    Modifier.fillMaxWidth(),
-                    icon = PixelData.ICON_UP,
-                    enabled = addr.isNotBlank()
-                ) { picker.launch(arrayOf("*/*")) }
-                Spacer(Modifier.height(10.dp))
-                Px("Or open any photo or file, tap Share, then pick Pindrop.", size = 12.sp, color = Muted)
-            }
-            Spacer(Modifier.height(14.dp))
-
-            // receive
+            // receive from laptop
             PixelCard("From laptop", PixelData.ICON_DOWN) {
                 Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
                     PxButton(
@@ -356,6 +534,133 @@ fun HomeScreen() {
             }
             Spacer(Modifier.height(14.dp))
 
+            // phones
+            PixelCard("Phones", PixelData.ICON_PHONE) {
+                Px("Your code", size = 11.sp, color = Muted)
+                Spacer(Modifier.height(8.dp))
+                if (qr != null) {
+                    Box(Modifier.fillMaxWidth(), contentAlignment = Alignment.Center) {
+                        QrView(qr)
+                    }
+                    Spacer(Modifier.height(8.dp))
+                    Px(
+                        (myIp ?: "") + ":" + myPort,
+                        modifier = Modifier.fillMaxWidth(),
+                        size = 12.sp,
+                        color = Muted,
+                        align = TextAlign.Center
+                    )
+                } else {
+                    DashedBox {
+                        Px(
+                            "No Wi-Fi found. Join the same Wi-Fi or hotspot as the other phone, then tap Refresh.",
+                            size = 12.sp,
+                            color = Muted,
+                            align = TextAlign.Center
+                        )
+                    }
+                }
+                Spacer(Modifier.height(8.dp))
+                Px(
+                    "To pair: on the other phone, open Pindrop and tap Scan a code. Only show this code to phones you trust.",
+                    size = 11.sp,
+                    color = Muted
+                )
+                Spacer(Modifier.height(14.dp))
+                Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                    PxButton("Scan a code", Modifier.weight(1f), icon = PixelData.ICON_QR) {
+                        scanner.launch(
+                            ScanOptions().apply {
+                                setDesiredBarcodeFormats(ScanOptions.QR_CODE)
+                                setPrompt("Point at the code on the other phone")
+                                setBeepEnabled(false)
+                                setOrientationLocked(false)
+                            }
+                        )
+                    }
+                    PxButton("Refresh", Modifier.weight(1f), filled = false) { refreshAddress() }
+                }
+                Spacer(Modifier.height(10.dp))
+                PxButton(
+                    "Copy my code",
+                    Modifier.fillMaxWidth(),
+                    icon = PixelData.ICON_COPY,
+                    filled = false,
+                    enabled = qr != null
+                ) {
+                    val ip = myIp
+                    if (ip != null && myPort > 0) {
+                        clipboard.setText(AnnotatedString(Peers.pairingUri(ctx, ip, myPort)))
+                        pairMsg = "Code copied. Send it only to a phone you trust."
+                    }
+                }
+                Spacer(Modifier.height(14.dp))
+                DashedBox {
+                    BasicTextField(
+                        value = pasted,
+                        onValueChange = { pasted = it },
+                        singleLine = true,
+                        textStyle = TextStyle(color = Cream, fontSize = 13.sp),
+                        cursorBrush = SolidColor(Orange),
+                        modifier = Modifier.fillMaxWidth(),
+                        decorationBox = { inner ->
+                            Box(Modifier.fillMaxWidth()) {
+                                if (pasted.isEmpty()) {
+                                    Body("Or paste a code here", size = 13.sp, color = Muted)
+                                }
+                                inner()
+                            }
+                        }
+                    )
+                }
+                Spacer(Modifier.height(10.dp))
+                PxButton(
+                    "Add this code",
+                    Modifier.fillMaxWidth(),
+                    filled = false,
+                    enabled = pasted.isNotBlank()
+                ) { addPeerFromCode(pasted) }
+                if (pairMsg.isNotEmpty()) {
+                    Spacer(Modifier.height(10.dp))
+                    Px(pairMsg, size = 12.sp, color = if (pairMsg.startsWith("Can't")) RedErr else Cream)
+                }
+                Spacer(Modifier.height(16.dp))
+                Px("Paired phones", size = 11.sp, color = Muted)
+                Spacer(Modifier.height(6.dp))
+                if (peers.isEmpty()) {
+                    DashedBox {
+                        Px("No phones yet.", size = 13.sp, bold = true, align = TextAlign.Center, modifier = Modifier.fillMaxWidth())
+                    }
+                } else {
+                    peers.forEach { p ->
+                        Row(
+                            Modifier
+                                .fillMaxWidth()
+                                .padding(vertical = 8.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            PxIcon(PixelData.ICON_PHONE, Orange, 2.dp)
+                            Spacer(Modifier.width(10.dp))
+                            Column(Modifier.weight(1f)) {
+                                Px(p.name, size = 13.sp, bold = true, maxLines = 1)
+                                Px(p.addr, size = 11.sp, color = Muted, maxLines = 1)
+                            }
+                            Spacer(Modifier.width(8.dp))
+                            PxButton("Test", compact = true, filled = false) { testPeer(p) }
+                            Spacer(Modifier.width(6.dp))
+                            PxButton("Remove", compact = true, filled = false) { removePeer(p) }
+                        }
+                    }
+                    Spacer(Modifier.height(6.dp))
+                    Px(
+                        "If a phone can't be reached, its address may have changed. Scan its code again.",
+                        size = 11.sp,
+                        color = Muted
+                    )
+                }
+            }
+            Spacer(Modifier.height(14.dp))
+
             // activity
             PixelCard("Activity", PixelData.ICON_DOC) {
                 if (transfers.isEmpty()) {
@@ -377,7 +682,7 @@ fun HomeScreen() {
             }
             Spacer(Modifier.height(18.dp))
             Px(
-                "Keep Pindrop open on your laptop.",
+                "Keep Pindrop open on the device that is receiving.",
                 modifier = Modifier.fillMaxWidth(),
                 size = 11.sp,
                 color = Muted,
