@@ -1,6 +1,9 @@
 package com.pindrop.app
 
+import android.Manifest
+import android.content.pm.PackageManager
 import android.net.Uri
+import android.os.Build
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -54,9 +57,11 @@ import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.core.content.ContextCompat
 import com.journeyapps.barcodescanner.ScanContract
 import com.journeyapps.barcodescanner.ScanOptions
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
@@ -125,6 +130,13 @@ fun HomeScreen() {
     var pasted by remember { mutableStateOf("") }
     var showCode by remember { mutableStateOf(false) }
 
+    // sending without a shared Wi-Fi
+    var hotOn by remember { mutableStateOf(false) }
+    var hotQr by remember { mutableStateOf<Array<BooleanArray>?>(null) }
+    var hotMsg by remember { mutableStateOf("") }
+    val hotQueue = remember { mutableStateListOf<Uri>() }
+    var joined by remember { mutableStateOf(false) }
+
     val mood = when {
         kind == 2 -> Mood.ERROR
         kind == 3 || checking -> Mood.BUSY
@@ -147,30 +159,6 @@ fun HomeScreen() {
             return if (addr.isBlank()) null else Target("Laptop", addr, null)
         }
         return peers.firstOrNull { it.key == selected }?.target()
-    }
-
-    // This phone listens for files from other phones while the app is open.
-    DisposableEffect(Unit) {
-        PhoneServer.listener = { what, name, size ->
-            scope.launch {
-                if (what == "pair") {
-                    refreshPeers()
-                    pairMsg = name + " paired with you."
-                } else {
-                    val t = Transfer(name, "RECEIVED")
-                    t.fraction = 1f
-                    t.state = "RECEIVED"
-                    t.note = "In Downloads/Pindrop (" + fmtSize(size) + ")"
-                    transfers.add(0, t)
-                }
-            }
-        }
-        PhoneServer.start(ctx)
-        refreshAddress()
-        onDispose {
-            PhoneServer.listener = null
-            PhoneServer.stop()
-        }
     }
 
     val qr: Array<BooleanArray>? = remember(myIp, myPort) {
@@ -205,37 +193,46 @@ fun HomeScreen() {
         checking = false
     }
 
-    fun sendUri(uri: Uri, target: Target) {
-        scope.launch {
-            val info = try {
-                withContext(Dispatchers.IO) { fileInfo(ctx, uri) }
-            } catch (e: Exception) {
-                null
-            }
-            if (info == null) {
-                val bad = Transfer("file", "SENT")
-                bad.state = "FAILED"
-                bad.note = "Can't read this file."
-                transfers.add(0, bad)
-                return@launch
-            }
-            val t = Transfer(info.name, "SENT")
-            t.note = "To " + target.name
-            transfers.add(0, t)
-            try {
-                withContext(Dispatchers.IO) {
-                    Net.upload(target.addr, info, target.key) { sent ->
-                        t.fraction = if (info.size > 0) sent.toFloat() / info.size.toFloat() else 0f
-                    }
+    suspend fun sendOne(uri: Uri, target: Target) {
+        val info = try {
+            withContext(Dispatchers.IO) { fileInfo(ctx, uri) }
+        } catch (e: Exception) {
+            null
+        }
+        if (info == null) {
+            val bad = Transfer("file", "SENT")
+            bad.state = "FAILED"
+            bad.note = "Can't read this file."
+            transfers.add(0, bad)
+            return
+        }
+        val t = Transfer(info.name, "SENT")
+        t.note = "To " + target.name
+        transfers.add(0, t)
+        try {
+            withContext(Dispatchers.IO) {
+                Net.upload(target.addr, info, target.key) { sent ->
+                    t.fraction = if (info.size > 0) sent.toFloat() / info.size.toFloat() else 0f
                 }
-                t.fraction = 1f
-                t.state = "SENT"
-            } catch (e: Exception) {
-                t.state = "FAILED"
-                t.note = Net.friendly(e, whoName(target))
-            } finally {
-                info.release()
             }
+            t.fraction = 1f
+            t.state = "SENT"
+        } catch (e: Exception) {
+            t.state = "FAILED"
+            t.note = Net.friendly(e, whoName(target))
+        } finally {
+            info.release()
+        }
+    }
+
+    fun sendUri(uri: Uri, target: Target) {
+        scope.launch { sendOne(uri, target) }
+    }
+
+    fun sendMany(uris: List<Uri>, target: Target, whenDone: () -> Unit) {
+        scope.launch {
+            for (u in uris) sendOne(u, target)
+            whenDone()
         }
     }
 
@@ -261,7 +258,129 @@ fun HomeScreen() {
         }
     }
 
+    fun stopHot() {
+        Hotspot.stop()
+        PhoneServer.hotMode = false
+        hotOn = false
+        hotQr = null
+        hotQueue.clear()
+    }
+
+    fun beginHot() {
+        if (hotQueue.isEmpty()) return
+        if (myPort <= 0) {
+            hotMsg = "Couldn't start. Tap Refresh in Phones, then try again."
+            hotQueue.clear()
+            return
+        }
+        hotMsg = "Starting the temporary Wi-Fi..."
+        val before = Hotspot.allIps()
+        PhoneServer.hotMode = true
+        hotOn = true
+        Hotspot.start(
+            ctx,
+            { ssid, pass, wpa3 ->
+                scope.launch {
+                    var ip: String? = null
+                    var tries = 0
+                    while (ip == null && tries < 20) {
+                        ip = (Hotspot.allIps() - before).firstOrNull()
+                        if (ip == null) {
+                            delay(300)
+                            tries++
+                        }
+                    }
+                    if (ip == null) {
+                        stopHot()
+                        hotMsg = "Couldn't find the temporary Wi-Fi address. Try again."
+                        return@launch
+                    }
+                    val code = try {
+                        Qr.encode(Hotspot.hotUri(ctx, ip, myPort, ssid, pass, wpa3))
+                    } catch (e: Exception) {
+                        null
+                    }
+                    if (code == null) {
+                        stopHot()
+                        hotMsg = "Couldn't make the code. Try again."
+                        return@launch
+                    }
+                    hotQr = code
+                    hotMsg = "Ask the other phone to open Pindrop, tap Scan a code, and point it here."
+                }
+            },
+            { why ->
+                scope.launch {
+                    stopHot()
+                    hotMsg = why
+                }
+            }
+        )
+    }
+
+    val permLauncher = rememberLauncherForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { result ->
+        if (result.values.any { it }) {
+            beginHot()
+        } else {
+            hotQueue.clear()
+            hotMsg = "Pindrop needs the Location permission to make a temporary Wi-Fi."
+        }
+    }
+
+    val hotPicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) { uris ->
+        if (uris.isNotEmpty()) {
+            hotQueue.clear()
+            hotQueue.addAll(uris)
+            val need = mutableListOf(Manifest.permission.ACCESS_FINE_LOCATION)
+            if (Build.VERSION.SDK_INT >= 33) need.add(Manifest.permission.NEARBY_WIFI_DEVICES)
+            val missing = need.filter {
+                ContextCompat.checkSelfPermission(ctx, it) != PackageManager.PERMISSION_GRANTED
+            }
+            if (missing.isEmpty()) beginHot() else permLauncher.launch(missing.toTypedArray())
+        }
+    }
+
+    fun joinHot(code: HotCode) {
+        pairMsg = "Joining " + code.peer.name + "'s Wi-Fi. Tap Connect if Android asks."
+        Hotspot.join(
+            ctx,
+            code,
+            {
+                scope.launch {
+                    delay(800)
+                    try {
+                        withContext(Dispatchers.IO) {
+                            Net.pair(code.peer, Peers.myName(), myPort, Prefs.getKey(ctx))
+                        }
+                        joined = true
+                        pairMsg = "Connected. Waiting for files from " + code.peer.name + "..."
+                    } catch (e: Exception) {
+                        Hotspot.leave()
+                        joined = false
+                        pairMsg = Net.friendly(e, code.peer.name)
+                    }
+                }
+            },
+            { why -> scope.launch { pairMsg = why } },
+            {
+                scope.launch {
+                    joined = false
+                    pairMsg = "Disconnected from the temporary Wi-Fi."
+                }
+            }
+        )
+    }
+
     fun addPeerFromCode(raw: String) {
+        val hot = Hotspot.parseHot(raw)
+        if (hot != null) {
+            if (myPort <= 0) {
+                pairMsg = "This phone isn't ready yet. Tap Refresh, then try again."
+            } else {
+                joinHot(hot)
+            }
+            return
+        }
         val p = Peers.parse(raw)
         if (p == null) {
             pairMsg = "That isn't a Pindrop code."
@@ -302,6 +421,43 @@ fun HomeScreen() {
         Peers.remove(ctx, p)
         refreshPeers()
         if (selected == p.key) selected = "laptop"
+    }
+
+    // This phone listens for files from other phones while the app is open.
+    DisposableEffect(Unit) {
+        PhoneServer.listener = { what, name, size ->
+            scope.launch {
+                if (what == "pair") {
+                    refreshPeers()
+                    pairMsg = name + " paired with you."
+                } else if (what == "hot") {
+                    val p = PhoneServer.lastHot
+                    if (p != null && hotQueue.isNotEmpty()) {
+                        val files = hotQueue.toList()
+                        hotMsg = "Sending to " + p.name + "..."
+                        sendMany(files, p.target()) {
+                            stopHot()
+                            hotMsg = "Done. The temporary Wi-Fi is off."
+                        }
+                    }
+                } else {
+                    val t = Transfer(name, "RECEIVED")
+                    t.fraction = 1f
+                    t.state = "RECEIVED"
+                    t.note = "In Downloads/Pindrop (" + fmtSize(size) + ")"
+                    transfers.add(0, t)
+                }
+            }
+        }
+        PhoneServer.start(ctx)
+        refreshAddress()
+        onDispose {
+            PhoneServer.listener = null
+            PhoneServer.hotMode = false
+            Hotspot.stop()
+            Hotspot.leave()
+            PhoneServer.stop()
+        }
     }
 
     val picker = rememberLauncherForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) { uris ->
@@ -524,6 +680,60 @@ fun HomeScreen() {
             }
             Spacer(Modifier.height(14.dp))
 
+            // no shared Wi-Fi
+            PixelCard("No Wi-Fi? Send directly", PixelData.ICON_QR) {
+                if (hotOn) {
+                    val q = hotQr
+                    if (q != null) {
+                        Box(Modifier.fillMaxWidth(), contentAlignment = Alignment.Center) {
+                            QrView(q, 200.dp)
+                        }
+                        Spacer(Modifier.height(10.dp))
+                    }
+                    Body(
+                        hotMsg,
+                        modifier = Modifier.fillMaxWidth(),
+                        size = 13.sp,
+                        color = Cream,
+                        align = TextAlign.Center
+                    )
+                    Spacer(Modifier.height(12.dp))
+                    PxButton("Stop", Modifier.fillMaxWidth(), filled = false) {
+                        stopHot()
+                        hotMsg = "Stopped."
+                    }
+                } else {
+                    Body(
+                        "No shared Wi-Fi or hotspot? Pindrop can make a temporary Wi-Fi. " +
+                            "Choose your files, then the other phone scans your code and joins it.",
+                        size = 13.sp,
+                        color = Muted
+                    )
+                    Spacer(Modifier.height(6.dp))
+                    Body(
+                        "Both phones need Pindrop open. Location must be on. The other phone leaves the internet for a moment.",
+                        size = 12.sp,
+                        color = Muted
+                    )
+                    Spacer(Modifier.height(12.dp))
+                    PxButton("Choose files and start", Modifier.fillMaxWidth(), icon = PixelData.ICON_UP) {
+                        hotMsg = ""
+                        hotPicker.launch(arrayOf("*/*"))
+                    }
+                    if (hotMsg.isNotEmpty()) {
+                        Spacer(Modifier.height(10.dp))
+                        Body(
+                            hotMsg,
+                            size = 13.sp,
+                            color = if (hotMsg.startsWith("Couldn't") || hotMsg.startsWith("Turn off") ||
+                                hotMsg.startsWith("Pindrop needs")
+                            ) RedErr else Cream
+                        )
+                    }
+                }
+            }
+            Spacer(Modifier.height(14.dp))
+
             // phones
             PixelCard("Phones", PixelData.ICON_PHONE) {
                 if (qr != null) {
@@ -623,6 +833,14 @@ fun HomeScreen() {
                 if (pairMsg.isNotEmpty()) {
                     Spacer(Modifier.height(10.dp))
                     Body(pairMsg, size = 13.sp, color = if (pairMsg.startsWith("Can't")) RedErr else Cream)
+                }
+                if (joined) {
+                    Spacer(Modifier.height(10.dp))
+                    PxButton("Disconnect", Modifier.fillMaxWidth(), filled = false) {
+                        Hotspot.leave()
+                        joined = false
+                        pairMsg = "Disconnected."
+                    }
                 }
                 Spacer(Modifier.height(16.dp))
                 Body("Paired phones", size = 12.sp, color = Muted)

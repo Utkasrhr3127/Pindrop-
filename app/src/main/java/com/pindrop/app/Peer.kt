@@ -89,6 +89,14 @@ object PhoneServer {
     @Volatile
     var listener: ((kind: String, name: String, size: Long) -> Unit)? = null
 
+    /** True while this phone runs its own temporary Wi-Fi. */
+    @Volatile
+    var hotMode = false
+
+    /** The phone that last joined during hotMode. */
+    @Volatile
+    var lastHot: Peer? = null
+
     private val server = PeerServer(object : PeerServer.Host {
         override fun key(): ByteArray = Prefs.getKey(app!!)
 
@@ -107,8 +115,15 @@ object PhoneServer {
         }
 
         override fun paired(name: String, host: String, port: Int, keyB64: String) {
-            Peers.add(app!!, Peer(name, host, port, keyB64))
-            listener?.invoke("pair", name, 0)
+            val p = Peer(name, host, port, keyB64)
+            if (hotMode) {
+                // joined our temporary Wi-Fi: use it now, don't save it
+                lastHot = p
+                listener?.invoke("hot", name, 0)
+            } else {
+                Peers.add(app!!, p)
+                listener?.invoke("pair", name, 0)
+            }
         }
     })
 
