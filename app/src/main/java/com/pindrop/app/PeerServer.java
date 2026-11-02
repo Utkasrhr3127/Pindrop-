@@ -12,10 +12,15 @@ import java.net.Socket;
 import java.net.URLDecoder;
 import java.net.URLEncoder;
 import java.nio.charset.StandardCharsets;
+import java.security.SecureRandom;
 import java.util.HashMap;
+import java.util.Iterator;
 import java.util.Map;
 import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
+import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.SynchronousQueue;
+import java.util.concurrent.ThreadPoolExecutor;
+import java.util.concurrent.TimeUnit;
 
 /**
  * Small web server that lets another paired phone send files here. It speaks the same /ping and /upload
@@ -31,7 +36,11 @@ public final class PeerServer {
     }
 
     public interface Host {
+        /** The long-lived key of this phone (used for pings and normal pairing). */
         byte[] key();
+
+        /** A throw-away key for a "no Wi-Fi" session, or null. While set, ONLY this key is accepted for uploads. */
+        byte[] sessionKey();
 
         String deviceName();
 
@@ -42,10 +51,41 @@ public final class PeerServer {
         void paired(String name, String host, int port, String keyB64);
     }
 
+    private static final int MAX_HEADERS = 64;
+    private static final int MAX_WORKERS = 12;
+    private static final long NONCE_LIFETIME_MS = 30_000L;
+    private static final int MAX_NONCES = 256;
+    private static final SecureRandom RNG = new SecureRandom();
+
     private final Host host;
     private ServerSocket server;
     private ExecutorService pool;
     public volatile int port;
+
+    /** Single-use challenges handed out by GET /challenge: nonce (base64) -> time it was issued. */
+    private final Map<String, Long> nonces = new HashMap<>();
+
+    private String issueNonce() {
+        byte[] n = new byte[16];
+        RNG.nextBytes(n);
+        String s = Secure.b64(n);
+        long now = System.currentTimeMillis();
+        synchronized (nonces) {
+            Iterator<Map.Entry<String, Long>> it = nonces.entrySet().iterator();
+            while (it.hasNext()) if (now - it.next().getValue() > NONCE_LIFETIME_MS) it.remove();
+            if (nonces.size() >= MAX_NONCES) return null;
+            nonces.put(s, now);
+        }
+        return s;
+    }
+
+    /** True exactly once for a nonce we issued in the last 30 seconds. */
+    private boolean consumeNonce(String s) {
+        synchronized (nonces) {
+            Long t = nonces.remove(s);
+            return t != null && System.currentTimeMillis() - t <= NONCE_LIFETIME_MS;
+        }
+    }
 
     public PeerServer(Host host) {
         this.host = host;
@@ -65,7 +105,7 @@ public final class PeerServer {
         }
         server = s;
         port = s.getLocalPort();
-        pool = Executors.newCachedThreadPool(r -> {
+        pool = new ThreadPoolExecutor(0, MAX_WORKERS, 30L, TimeUnit.SECONDS, new SynchronousQueue<Runnable>(), r -> {
             Thread t = new Thread(r, "pindrop-peer");
             t.setDaemon(true);
             return t;
@@ -75,7 +115,11 @@ public final class PeerServer {
             while (!ss.isClosed()) {
                 try {
                     final Socket c = ss.accept();
-                    pool.execute(() -> handle(c));
+                    try {
+                        pool.execute(() -> handle(c));
+                    } catch (RejectedExecutionException busy) {
+                        try { c.close(); } catch (IOException ignored) { } // too many at once: drop the extra
+                    }
                 } catch (IOException e) {
                     break;
                 }
@@ -143,6 +187,7 @@ public final class PeerServer {
                 String l = readLine(in);
                 if (l == null) return;
                 if (l.isEmpty()) break;
+                if (h.size() >= MAX_HEADERS) return;
                 int i = l.indexOf(':');
                 if (i > 0) h.put(l.substring(0, i).trim().toLowerCase(), l.substring(i + 1).trim());
             }
@@ -152,6 +197,10 @@ public final class PeerServer {
             String query = q < 0 ? "" : full.substring(q + 1);
             if (method.equals("GET") && path.equals("/ping")) {
                 ping(out, query);
+            } else if (method.equals("GET") && path.equals("/challenge")) {
+                String n = issueNonce();
+                if (n == null) respond(out, 503, "Busy", none());
+                else respond(out, 200, n, none());
             } else if (method.equals("POST") && (path.equals("/upload") || path.equals("/pair"))) {
                 sealed(sock, in, out, h, path.equals("/pair"));
             } else {
@@ -187,34 +236,74 @@ public final class PeerServer {
         return n.isEmpty() ? "file" : n;
     }
 
+    /** A name that is safe to show and store: no control characters, at most 30 characters. */
+    static String cleanDeviceName(String n) {
+        String c = n.replaceAll("[\\p{Cntrl}<>]", "").trim();
+        if (c.length() > 30) c = c.substring(0, 30);
+        return c.isEmpty() ? "Phone" : c;
+    }
+
+    private static boolean goodKey(String k) {
+        try {
+            return Secure.unb64(k).length == 32;
+        } catch (RuntimeException e) {
+            return false;
+        }
+    }
+
+    /** Counts the bytes that really get written, so the size we report is exact. */
+    private static final class CountingOut extends OutputStream {
+        final OutputStream inner;
+        long count;
+
+        CountingOut(OutputStream inner) {
+            this.inner = inner;
+        }
+
+        @Override public void write(int b) throws IOException { inner.write(b); count++; }
+
+        @Override public void write(byte[] b, int off, int len) throws IOException { inner.write(b, off, len); count += len; }
+
+        @Override public void flush() throws IOException { inner.flush(); }
+
+        @Override public void close() throws IOException { inner.close(); }
+    }
+
     private void sealed(Socket sock, InputStream in, OutputStream out, Map<String, String> h, boolean isPair)
             throws IOException {
-        String saltS = h.get("x-pd-salt"), authS = h.get("x-pd-auth"), lenS = h.get("content-length");
+        String saltS = h.get("x-pd-salt"), nonceS = h.get("x-pd-nonce"), authS = h.get("x-pd-auth"), lenS = h.get("content-length");
         long total;
-        byte[] salt, auth;
+        byte[] salt, nonce, auth;
         try {
             total = Long.parseLong(lenS);
             salt = Secure.unb64(saltS);
+            nonce = Secure.unb64(nonceS);
             auth = Secure.unb64(authS);
         } catch (RuntimeException e) {
             respond(out, 400, "Bad request", none());
             return;
         }
-        if (total < 2 + Secure.MAC_LEN || (isPair && total > 8192)) {
+        if (salt.length != 16 || nonce.length != 16 || total < 2 + Secure.MAC_LEN || (isPair && total > 8192)) {
             respond(out, 400, "Bad request", none());
             return;
         }
-        byte[] key = host.key();
-        if (!Secure.same(auth, Secure.tag(key, "auth", salt, total))) {
+        byte[] session = host.sessionKey();
+        byte[] key = session != null ? session : host.key();
+        if (!Secure.same(auth, Secure.tag(key, "auth", salt, nonce, total))) {
             respond(out, 403, "Not paired with this phone", none());
             return;
         }
+        // The nonce is spent only after the sender proved it knows the key, so strangers can't burn them.
+        if (!consumeNonce(nonceS)) {
+            respond(out, 403, "Expired. Try again.", none());
+            return;
+        }
         Map<String, String> ok = new HashMap<>();
-        ok.put("X-Pd-Proof", Secure.b64(Secure.proof(key, salt, total)));
+        ok.put("X-Pd-Proof", Secure.b64(Secure.proof(key, salt, nonce, total)));
 
         if (isPair) {
             final ByteArrayOutputStream mem = new ByteArrayOutputStream();
-            boolean good = Secure.open(in, key, salt, total, name -> mem);
+            boolean good = Secure.open(in, key, salt, nonce, total, name -> mem);
             if (!good) {
                 respond(out, 403, "Bad data", none());
                 return;
@@ -222,15 +311,21 @@ public final class PeerServer {
             String body = new String(mem.toByteArray(), StandardCharsets.UTF_8);
             String name = "Phone", keyB64 = null;
             int port = 0;
-            for (String kv : body.split("&")) {
-                int i = kv.indexOf('=');
-                if (i < 0) continue;
-                String k = kv.substring(0, i), v = URLDecoder.decode(kv.substring(i + 1), "UTF-8");
-                if (k.equals("n")) name = v;
-                else if (k.equals("p")) port = Integer.parseInt(v);
-                else if (k.equals("k")) keyB64 = v;
+            try {
+                for (String kv : body.split("&")) {
+                    int i = kv.indexOf('=');
+                    if (i < 0) continue;
+                    String k = kv.substring(0, i), v = URLDecoder.decode(kv.substring(i + 1), "UTF-8");
+                    if (k.equals("n")) name = cleanDeviceName(v);
+                    else if (k.equals("p")) {
+                        try { port = Integer.parseInt(v.trim()); } catch (NumberFormatException e) { port = 0; }
+                    } else if (k.equals("k")) keyB64 = v;
+                }
+            } catch (IllegalArgumentException e) {
+                respond(out, 400, "Bad data", none());
+                return;
             }
-            if (keyB64 == null || port <= 0) {
+            if (keyB64 == null || !goodKey(keyB64) || port < 1 || port > 65535) {
                 respond(out, 400, "Bad data", none());
                 return;
             }
@@ -242,14 +337,14 @@ public final class PeerServer {
 
         final Sink[] sinkRef = new Sink[1];
         final String[] nameRef = new String[1];
-        final int[] nameLen = new int[1];
+        final CountingOut[] counter = new CountingOut[1];
         boolean good;
         try {
-            good = Secure.open(in, key, salt, total, name -> {
-                nameLen[0] = name.getBytes(StandardCharsets.UTF_8).length;
+            good = Secure.open(in, key, salt, nonce, total, name -> {
                 nameRef[0] = cleanName(name);
                 sinkRef[0] = host.openFile(nameRef[0]);
-                return sinkRef[0].stream();
+                counter[0] = new CountingOut(sinkRef[0].stream());
+                return counter[0];
             });
         } catch (IOException e) {
             if (sinkRef[0] != null) sinkRef[0].finish(false);
@@ -262,8 +357,7 @@ public final class PeerServer {
             return;
         }
         sinkRef[0].finish(true);
-        long size = total - 2 - Secure.MAC_LEN - nameLen[0];
-        host.received(nameRef[0], Math.max(0, size));
+        host.received(nameRef[0], counter[0] == null ? 0 : counter[0].count);
         respond(out, 200, "OK", ok);
     }
 }

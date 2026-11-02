@@ -17,8 +17,10 @@ import javax.crypto.spec.SecretKeySpec;
 /**
  * Pindrop's phone-to-phone security. Built only from what Android already has.
  * <p>
- * Both phones share a 32-byte key (it travels in the pairing QR code). For every transfer:
- * a random salt makes fresh keys (AES-256-CTR for secrecy, HMAC-SHA256 for tamper checks).
+ * Both phones share a 32-byte key (it travels in the pairing QR code). For every transfer the receiver first
+ * hands out a single-use random nonce (GET /challenge), and the sender mixes it, plus its own random salt,
+ * into fresh keys (AES-256-CTR for secrecy, HMAC-SHA256 for tamper checks). Because the nonce is single-use
+ * and chosen by the receiver, a recorded upload can never be replayed.
  * The request body is: encrypt( [2-byte name length][file name][file bytes] ) followed by a 32-byte HMAC.
  * File names and contents are both hidden. A request without the right X-Pd-Auth tag is refused before
  * any data is read, and the answer carries X-Pd-Proof so the sender knows it reached the right phone.
@@ -63,9 +65,13 @@ public final class Secure {
         }
     }
 
+    /** HMAC over several parts. Every part is length-prefixed, so ("ab","c") can never equal ("a","bc"). */
     public static byte[] hmac(byte[] key, byte[]... parts) {
         Mac m = macOf(key);
-        for (byte[] p : parts) m.update(p);
+        for (byte[] p : parts) {
+            m.update(new byte[] {(byte) (p.length >>> 24), (byte) (p.length >>> 16), (byte) (p.length >>> 8), (byte) p.length});
+            m.update(p);
+        }
         return m.doFinal();
     }
 
@@ -73,9 +79,9 @@ public final class Secure {
         return s.getBytes(StandardCharsets.US_ASCII);
     }
 
-    /** A short tag tied to a label, the salt and the body length. */
-    public static byte[] tag(byte[] key, String label, byte[] salt, long total) {
-        return hmac(key, ascii(label), salt, ascii(Long.toString(total)));
+    /** A short tag tied to a label, the salt, the receiver's nonce and the body length. */
+    public static byte[] tag(byte[] key, String label, byte[] salt, byte[] nonce, long total) {
+        return hmac(key, ascii(label), salt, nonce, ascii(Long.toString(total)));
     }
 
     public static boolean same(byte[] a, byte[] b) {
@@ -85,9 +91,9 @@ public final class Secure {
     private static final class Keys {
         final byte[] enc, mac;
 
-        Keys(byte[] key, byte[] salt) {
-            enc = hmac(key, ascii("enc"), salt);
-            mac = hmac(key, ascii("mac"), salt);
+        Keys(byte[] key, byte[] salt, byte[] nonce) {
+            enc = hmac(key, ascii("enc"), salt, nonce);
+            mac = hmac(key, ascii("mac"), salt, nonce);
         }
 
         Cipher cipher() {
@@ -105,26 +111,29 @@ public final class Secure {
     /** Sending side. */
     public static final class Sealer {
         private final byte[] key;
+        private final byte[] nonce;
         private final byte[] salt = randomBytes(16);
         private final Cipher cipher;
         private final Mac mac;
         private final byte[] nameBytes;
         public final long total;
 
-        public Sealer(byte[] key, String name, long size) {
+        public Sealer(byte[] key, byte[] nonce, String name, long size) {
             this.key = key;
-            Keys k = new Keys(key, salt);
+            this.nonce = nonce;
+            Keys k = new Keys(key, salt, nonce);
             cipher = k.cipher();
             mac = macOf(k.mac);
             mac.update(salt);
-            byte[] nb = name.getBytes(StandardCharsets.UTF_8);
-            nameBytes = nb.length > 1000 ? java.util.Arrays.copyOf(nb, 1000) : nb;
+            mac.update(nonce);
+            nameBytes = clipUtf8(name, 1000);
             total = 2L + nameBytes.length + size + MAC_LEN;
         }
 
         public void applyHeaders(HttpURLConnection c) {
             c.setRequestProperty("X-Pd-Salt", b64(salt));
-            c.setRequestProperty("X-Pd-Auth", b64(tag(key, "auth", salt, total)));
+            c.setRequestProperty("X-Pd-Nonce", b64(nonce));
+            c.setRequestProperty("X-Pd-Auth", b64(tag(key, "auth", salt, nonce, total)));
         }
 
         /** True if the answer proves the other phone knows our shared key. */
@@ -132,7 +141,7 @@ public final class Secure {
             String got = c.getHeaderField("X-Pd-Proof");
             if (got == null) return false;
             try {
-                return same(unb64(got), tag(key, "ok", salt, total));
+                return same(unb64(got), tag(key, "ok", salt, nonce, total));
             } catch (IllegalArgumentException e) {
                 return false;
             }
@@ -158,21 +167,31 @@ public final class Secure {
         }
     }
 
+    /** Cuts a name to at most max UTF-8 bytes without ever splitting a character in half. */
+    public static byte[] clipUtf8(String name, int max) {
+        byte[] nb = name.getBytes(StandardCharsets.UTF_8);
+        if (nb.length <= max) return nb;
+        int end = max;
+        while (end > 0 && (nb[end] & 0xC0) == 0x80) end--; // step back to the start of a character
+        return java.util.Arrays.copyOf(nb, end);
+    }
+
     /** Proof the receiving phone puts in its answer. */
-    public static byte[] proof(byte[] key, byte[] salt, long total) {
-        return tag(key, "ok", salt, total);
+    public static byte[] proof(byte[] key, byte[] salt, byte[] nonce, long total) {
+        return tag(key, "ok", salt, nonce, total);
     }
 
     /**
      * Receiving side. Reads exactly `total` bytes, decrypts as it goes, and hands the file bytes to the
      * sink. Returns true only if the closing HMAC matches, so the caller must throw the file away on false.
      */
-    public static boolean open(InputStream in, byte[] key, byte[] salt, long total, SinkFactory factory)
+    public static boolean open(InputStream in, byte[] key, byte[] salt, byte[] nonce, long total, SinkFactory factory)
             throws IOException {
-        Keys k = new Keys(key, salt);
+        Keys k = new Keys(key, salt, nonce);
         Cipher cipher = k.cipher();
         Mac mac = macOf(k.mac);
         mac.update(salt);
+        mac.update(nonce);
         long remaining = total - MAC_LEN;
         byte[] buf = new byte[64 * 1024];
         ByteArrayOutputStream head = new ByteArrayOutputStream();

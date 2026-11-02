@@ -10,6 +10,7 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.Image
+import androidx.compose.ui.text.input.KeyboardCapitalization
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -85,6 +86,16 @@ fun whoName(t: Target): String = if (t.key == null) "your laptop" else t.name
 /** A paired phone as a place to send files. */
 fun Peer.target(): Target = Target(name, addr, Secure.unb64(key))
 
+/** Spoken status of the laptop for the pill at the top. */
+private fun stateText(kind: Int): String = when (kind) {
+    1 -> "Laptop connected"
+    2 -> "Can't reach laptop"
+    3 -> "Checking"
+    4 -> "Needs access code"
+    5 -> "Laptop stopped"
+    else -> "Laptop not tested"
+}
+
 @Composable
 fun TargetChip(label: String, selected: Boolean, onClick: () -> Unit) {
     val shape = RoundedCornerShape(50)
@@ -114,7 +125,11 @@ fun HomeScreen() {
     val clipboard = LocalClipboardManager.current
 
     var addr by remember { mutableStateOf(Prefs.getAddr(ctx)) }
-    var kind by remember { mutableIntStateOf(0) } // 0 not tested, 1 connected, 2 failed, 3 checking
+    var code by remember { mutableStateOf(Prefs.getCode(ctx)) }
+    var kind by remember { mutableIntStateOf(0) } // 0 not tested, 1 connected, 2 failed, 3 checking, 4 needs code, 5 stopped
+    var activityOpen by remember { mutableStateOf(true) }
+    var settingsOpen by remember { mutableStateOf(false) }
+    var background by remember { mutableStateOf(Prefs.getBackground(ctx)) }
     var msg by remember { mutableStateOf("") }
     val transfers = remember { mutableStateListOf<Transfer>() }
     val waiting = remember { mutableStateListOf<OutItem>() }
@@ -129,6 +144,7 @@ fun HomeScreen() {
     var pairMsg by remember { mutableStateOf("") }
     var pasted by remember { mutableStateOf("") }
     var showCode by remember { mutableStateOf(false) }
+    var qrTick by remember { mutableIntStateOf(0) }
 
     // sending without a shared Wi-Fi
     var hotOn by remember { mutableStateOf(false) }
@@ -138,7 +154,7 @@ fun HomeScreen() {
     var joined by remember { mutableStateOf(false) }
 
     val mood = when {
-        kind == 2 -> Mood.ERROR
+        kind == 2 || kind == 4 || kind == 5 -> Mood.ERROR
         kind == 3 || checking -> Mood.BUSY
         kind == 1 -> Mood.DONE
         else -> Mood.IDLE
@@ -156,12 +172,12 @@ fun HomeScreen() {
 
     fun currentTarget(): Target? {
         if (selected == "laptop") {
-            return if (addr.isBlank()) null else Target("Laptop", addr, null)
+            return if (addr.isBlank()) null else Target("Laptop", addr, null, code)
         }
         return peers.firstOrNull { it.key == selected }?.target()
     }
 
-    val qr: Array<BooleanArray>? = remember(myIp, myPort) {
+    val qr: Array<BooleanArray>? = remember(myIp, myPort, qrTick) {
         val ip = myIp
         if (ip == null || myPort <= 0) {
             null
@@ -182,7 +198,7 @@ fun HomeScreen() {
         checking = true
         waitingMsg = ""
         try {
-            val items = withContext(Dispatchers.IO) { Net.listOutbox(addr) }.filter { it.status == "waiting" }
+            val items = withContext(Dispatchers.IO) { Net.listOutbox(addr, code) }.filter { it.status == "waiting" }
             waiting.clear()
             waiting.addAll(items)
             if (items.isEmpty()) waitingMsg = "Nothing waiting."
@@ -209,9 +225,10 @@ fun HomeScreen() {
         val t = Transfer(info.name, "SENT")
         t.note = "To " + target.name
         transfers.add(0, t)
+        TransferService.hold(ctx)
         try {
             withContext(Dispatchers.IO) {
-                Net.upload(target.addr, info, target.key) { sent ->
+                Net.upload(target.addr, info, target.key, code = target.code) { sent ->
                     t.fraction = if (info.size > 0) sent.toFloat() / info.size.toFloat() else 0f
                 }
             }
@@ -222,6 +239,7 @@ fun HomeScreen() {
             t.note = Net.friendly(e, whoName(target))
         } finally {
             info.release()
+            TransferService.release(ctx)
         }
     }
 
@@ -241,9 +259,10 @@ fun HomeScreen() {
             val t = Transfer(item.name, "SAVED")
             t.state = "SAVING"
             transfers.add(0, t)
+            TransferService.hold(ctx)
             try {
                 withContext(Dispatchers.IO) {
-                    Net.download(ctx, addr, item) { got ->
+                    Net.download(ctx, addr, code, item) { got ->
                         t.fraction = if (item.size > 0) got.toFloat() / item.size.toFloat() else 0f
                     }
                 }
@@ -254,6 +273,8 @@ fun HomeScreen() {
             } catch (e: Exception) {
                 t.state = "FAILED"
                 t.note = Net.friendly(e)
+            } finally {
+                TransferService.release(ctx)
             }
         }
     }
@@ -261,6 +282,7 @@ fun HomeScreen() {
     fun stopHot() {
         Hotspot.stop()
         PhoneServer.hotMode = false
+        PhoneServer.session = null
         hotOn = false
         hotQr = null
         hotQueue.clear()
@@ -275,6 +297,7 @@ fun HomeScreen() {
         }
         hotMsg = "Starting the temporary Wi-Fi..."
         val before = Hotspot.allIps()
+        PhoneServer.session = Secure.newKey() // a throw-away key just for this session
         PhoneServer.hotMode = true
         hotOn = true
         Hotspot.start(
@@ -340,30 +363,43 @@ fun HomeScreen() {
         }
     }
 
-    fun joinHot(code: HotCode) {
-        pairMsg = "Joining " + code.peer.name + "'s Wi-Fi. Tap Connect if Android asks."
+    fun endJoin() {
+        Hotspot.leave()
+        PhoneServer.session = null
+        joined = false
+    }
+
+    fun joinHot(hot: HotCode) {
+        pairMsg = "Joining " + hot.peer.name + "'s Wi-Fi. Tap Connect if Android asks."
+        val mine = Secure.newKey() // this phone's throw-away key for the session
+        PhoneServer.session = mine
         Hotspot.join(
             ctx,
-            code,
+            hot,
             {
                 scope.launch {
                     delay(800)
                     try {
                         withContext(Dispatchers.IO) {
-                            Net.pair(code.peer, Peers.myName(), myPort, Prefs.getKey(ctx))
+                            Net.pair(hot.peer, Peers.myName(), myPort, mine)
                         }
                         joined = true
-                        pairMsg = "Connected. Waiting for files from " + code.peer.name + "..."
+                        pairMsg = "Connected. Waiting for files from " + hot.peer.name + "..."
                     } catch (e: Exception) {
-                        Hotspot.leave()
-                        joined = false
-                        pairMsg = Net.friendly(e, code.peer.name)
+                        endJoin()
+                        pairMsg = Net.friendly(e, hot.peer.name)
                     }
                 }
             },
-            { why -> scope.launch { pairMsg = why } },
+            { why ->
+                scope.launch {
+                    PhoneServer.session = null
+                    pairMsg = why
+                }
+            },
             {
                 scope.launch {
+                    PhoneServer.session = null
                     joined = false
                     pairMsg = "Disconnected from the temporary Wi-Fi."
                 }
@@ -454,9 +490,25 @@ fun HomeScreen() {
         onDispose {
             PhoneServer.listener = null
             PhoneServer.hotMode = false
+            PhoneServer.session = null
             Hotspot.stop()
             Hotspot.leave()
             PhoneServer.stop()
+        }
+    }
+
+    // While the app is open, keep it alive in the background so files can still arrive with the screen off.
+    DisposableEffect(background) {
+        if (background) TransferService.hold(ctx)
+        onDispose { if (background) TransferService.release(ctx) }
+    }
+
+    val notifLauncher = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { }
+    LaunchedEffect(Unit) {
+        if (Build.VERSION.SDK_INT >= 33 &&
+            ContextCompat.checkSelfPermission(ctx, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
+        ) {
+            notifLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
         }
     }
 
@@ -479,151 +531,206 @@ fun HomeScreen() {
         if (addr.isNotBlank()) loadWaiting()
     }
 
-    Box(
-        Modifier
-            .fillMaxSize()
-            .background(Brush.verticalGradient(listOf(Color(0xFF151A26), Bg)))
-    ) {
+    Box(Modifier.fillMaxSize()) {
+        SceneBackdrop()
         Column(
             Modifier
                 .fillMaxSize()
                 .verticalScroll(rememberScrollState())
                 .padding(horizontal = 16.dp, vertical = 14.dp)
         ) {
-            // top row: logo and status
+            // top row: small logo and status
             Row(
                 Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.SpaceBetween,
                 verticalAlignment = Alignment.CenterVertically
             ) {
-                Image(
-                    painter = painterResource(R.drawable.pindrop_logo),
-                    contentDescription = "Pindrop",
-                    modifier = Modifier.size(34.dp)
+                AppBadge()
+                StatusPill(
+                    stateText(kind),
+                    when (kind) {
+                        1 -> GreenOk
+                        2, 4, 5 -> RedErr
+                        else -> Muted
+                    }
                 )
-                when (kind) {
-                    1 -> StatusPill("Laptop connected", Orange)
-                    2 -> StatusPill("Can't reach laptop", RedErr)
-                    3 -> StatusPill("Checking", Muted)
-                    else -> StatusPill("Laptop not tested", Muted)
-                }
             }
+            Spacer(Modifier.height(8.dp))
 
             // hero
-            Column(Modifier.fillMaxWidth(), horizontalAlignment = Alignment.CenterHorizontally) {
-                Mascot(mood, width = 120.dp)
-                Spacer(Modifier.height(6.dp))
-                Wordmark(width = 220.dp)
-                Spacer(Modifier.height(8.dp))
-                Body(
-                    "Send files to your laptop or a friend's phone",
-                    size = 13.sp,
-                    color = Muted,
-                    align = TextAlign.Center
-                )
+            Reveal(0) {
+                Column(Modifier.fillMaxWidth(), horizontalAlignment = Alignment.CenterHorizontally) {
+                    Mascot(mood, width = 128.dp)
+                    Spacer(Modifier.height(4.dp))
+                    Wordmark(size = 34.sp)
+                    Spacer(Modifier.height(8.dp))
+                    Body(
+                        "Send files to your laptop",
+                        size = 14.sp,
+                        color = Muted,
+                        align = TextAlign.Center,
+                        spacing = 1.5.sp
+                    )
+                }
             }
-            Spacer(Modifier.height(20.dp))
+            Spacer(Modifier.height(22.dp))
 
             // send
-            PixelCard("Send files", PixelData.ICON_UP) {
-                Body("Send to", size = 12.sp, color = Muted)
-                Spacer(Modifier.height(8.dp))
-                Row(
-                    Modifier.horizontalScroll(rememberScrollState()),
-                    horizontalArrangement = Arrangement.spacedBy(8.dp)
-                ) {
-                    TargetChip("Laptop", selected == "laptop") { selected = "laptop" }
-                    peers.forEach { p ->
-                        TargetChip(p.name, selected == p.key) { selected = p.key }
+            Reveal(1) {
+                PixelCard("Send files", Ic.SEND) {
+                    Body("Send to", size = 12.sp, color = Muted)
+                    Spacer(Modifier.height(8.dp))
+                    Row(
+                        Modifier.horizontalScroll(rememberScrollState()),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        TargetChip("Laptop", selected == "laptop") { selected = "laptop" }
+                        peers.forEach { p ->
+                            TargetChip(p.name, selected == p.key) { selected = p.key }
+                        }
                     }
+                    Spacer(Modifier.height(14.dp))
+                    PxButton(
+                        "Choose files",
+                        Modifier.fillMaxWidth(),
+                        icon = Ic.SEND,
+                        enabled = currentTarget() != null
+                    ) { picker.launch(arrayOf("*/*")) }
+                    Spacer(Modifier.height(10.dp))
+                    Body(
+                        if (selected == "laptop" && addr.isBlank()) {
+                            "Type your laptop's address below first."
+                        } else {
+                            "Or open any photo or file, tap Share, then pick Pindrop."
+                        },
+                        size = 12.sp,
+                        color = Muted
+                    )
                 }
-                Spacer(Modifier.height(14.dp))
-                PxButton(
-                    "Choose files",
-                    Modifier.fillMaxWidth(),
-                    icon = PixelData.ICON_UP,
-                    enabled = currentTarget() != null
-                ) { picker.launch(arrayOf("*/*")) }
-                Spacer(Modifier.height(10.dp))
-                Body(
-                    if (selected == "laptop" && addr.isBlank()) {
-                        "Type your laptop's address below first."
-                    } else {
-                        "Or open any photo or file, tap Share, then pick Pindrop."
-                    },
-                    size = 12.sp,
-                    color = Muted
-                )
             }
 
             if (selected == "laptop") {
                 Spacer(Modifier.height(14.dp))
 
-                // address
-                PixelCard("Laptop address", PixelData.ICON_LAPTOP) {
-                    DashedBox {
-                        BasicTextField(
-                            value = addr,
-                            onValueChange = { addr = it.trim() },
-                            singleLine = true,
-                            textStyle = TextStyle(
-                                color = Orange,
-                                fontFamily = PixelFont,
-                                fontWeight = FontWeight.Bold,
-                                fontSize = 24.sp,
-                                textAlign = TextAlign.Center
-                            ),
-                            cursorBrush = SolidColor(Orange),
-                            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Uri),
-                            modifier = Modifier.fillMaxWidth(),
-                            decorationBox = { inner ->
-                                Box(Modifier.fillMaxWidth(), contentAlignment = Alignment.Center) {
-                                    if (addr.isEmpty()) {
-                                        Px("192.168.43.25", size = 20.sp, color = SteelDim, bold = true)
+                // address and access code
+                Reveal(2) {
+                    PixelCard("Your laptop's address", Ic.LAPTOP) {
+                        FieldBox {
+                            BasicTextField(
+                                value = addr,
+                                onValueChange = { v ->
+                                    if (v.contains("?c=") || v.contains("&c=")) {
+                                        val (h, c) = splitLaptopInput(v)
+                                        addr = h
+                                        if (c.isNotEmpty()) code = c
+                                    } else {
+                                        addr = v.trim()
                                     }
-                                    inner()
+                                },
+                                singleLine = true,
+                                textStyle = TextStyle(
+                                    color = Cream,
+                                    fontWeight = FontWeight.SemiBold,
+                                    fontSize = 26.sp,
+                                    letterSpacing = 2.sp,
+                                    textAlign = TextAlign.Center
+                                ),
+                                cursorBrush = SolidColor(Orange),
+                                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Uri),
+                                modifier = Modifier.fillMaxWidth(),
+                                decorationBox = { inner ->
+                                    Box(Modifier.fillMaxWidth(), contentAlignment = Alignment.Center) {
+                                        if (addr.isEmpty()) {
+                                            Body("192.168.43.25", size = 24.sp, color = Color(0xFF3A4458), weight = FontWeight.SemiBold, spacing = 2.sp)
+                                        }
+                                        inner()
+                                    }
                                 }
-                            }
-                        )
-                    }
-                    Spacer(Modifier.height(8.dp))
-                    Body(
-                        "http://" + (if (addr.isBlank()) "..." else addr) + ":8765",
-                        modifier = Modifier.fillMaxWidth(),
-                        size = 12.sp,
-                        color = Muted,
-                        align = TextAlign.Center
-                    )
-                    Spacer(Modifier.height(14.dp))
-                    PxButton(
-                        "Save & test",
-                        Modifier.fillMaxWidth(),
-                        icon = PixelData.ICON_CHECK,
-                        enabled = addr.isNotBlank() && kind != 3
-                    ) {
-                        Prefs.setAddr(ctx, addr)
-                        kind = 3
-                        msg = ""
-                        scope.launch {
-                            val ok = withContext(Dispatchers.IO) { Net.ping(addr) }
-                            kind = if (ok) 1 else 2
-                            msg = if (ok) {
-                                "Pindrop found your laptop."
-                            } else {
-                                "Can't reach the laptop. Is Pindrop open, and are both on the same hotspot?"
-                            }
-                            if (ok) loadWaiting()
+                            )
                         }
-                    }
-                    if (msg.isNotEmpty()) {
-                        Spacer(Modifier.height(10.dp))
-                        Body(msg, size = 13.sp, color = if (kind == 2) RedErr else Cream)
+                        Spacer(Modifier.height(6.dp))
+                        Body(
+                            "http://" + (if (addr.isBlank()) "..." else addr) + ":8765",
+                            modifier = Modifier.fillMaxWidth(),
+                            size = 12.sp,
+                            color = Muted,
+                            align = TextAlign.Center
+                        )
+                        Spacer(Modifier.height(12.dp))
+                        Label("Access code", color = Muted)
+                        Spacer(Modifier.height(6.dp))
+                        FieldBox {
+                            BasicTextField(
+                                value = code,
+                                onValueChange = { code = cleanCode(it) },
+                                singleLine = true,
+                                textStyle = TextStyle(
+                                    color = Orange,
+                                    fontWeight = FontWeight.SemiBold,
+                                    fontSize = 22.sp,
+                                    letterSpacing = 5.sp,
+                                    textAlign = TextAlign.Center
+                                ),
+                                cursorBrush = SolidColor(Orange),
+                                keyboardOptions = KeyboardOptions(
+                                    capitalization = KeyboardCapitalization.Characters,
+                                    keyboardType = KeyboardType.Ascii
+                                ),
+                                modifier = Modifier.fillMaxWidth(),
+                                decorationBox = { inner ->
+                                    Box(Modifier.fillMaxWidth(), contentAlignment = Alignment.Center) {
+                                        if (code.isEmpty()) {
+                                            Body("K7MQ2XR9", size = 20.sp, color = Color(0xFF3A4458), weight = FontWeight.SemiBold, spacing = 5.sp)
+                                        }
+                                        inner()
+                                    }
+                                }
+                            )
+                        }
+                        Spacer(Modifier.height(6.dp))
+                        Body(
+                            "Shown in the laptop's Pindrop window. You can also paste the whole link into the address box.",
+                            size = 12.sp,
+                            color = Muted
+                        )
+                        Spacer(Modifier.height(14.dp))
+                        PxButton(
+                            "Save & test",
+                            Modifier.fillMaxWidth(),
+                            icon = Ic.CHECK,
+                            enabled = addr.isNotBlank() && kind != 3
+                        ) {
+                            Prefs.setAddr(ctx, addr)
+                            Prefs.setCode(ctx, code)
+                            kind = 3
+                            msg = ""
+                            scope.launch {
+                                val state = withContext(Dispatchers.IO) { Net.pingLaptop(addr, code) }
+                                kind = when (state) {
+                                    LaptopState.OK -> 1
+                                    LaptopState.NEEDS_CODE -> 4
+                                    LaptopState.STOPPED -> 5
+                                    LaptopState.DOWN -> 2
+                                }
+                                msg = when (state) {
+                                    LaptopState.OK -> "Pindrop found your laptop."
+                                    LaptopState.NEEDS_CODE -> "The laptop is there, but the access code is missing or wrong."
+                                    LaptopState.STOPPED -> "Pindrop is stopped on the laptop. Press Start there."
+                                    LaptopState.DOWN -> "Can't reach the laptop. Is Pindrop open, and are both on the same Wi-Fi or hotspot?"
+                                }
+                                if (state == LaptopState.OK) loadWaiting()
+                            }
+                        }
+                        if (msg.isNotEmpty()) {
+                            Spacer(Modifier.height(10.dp))
+                            Body(msg, size = 13.sp, color = if (kind == 1) Cream else RedErr)
+                        }
                     }
                 }
                 Spacer(Modifier.height(14.dp))
 
                 // receive from laptop
-                PixelCard("From laptop", PixelData.ICON_DOWN) {
+                PixelCard("From laptop", Ic.RECEIVE) {
                     Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
                         PxButton(
                             if (checking) "Checking" else "Check",
@@ -632,7 +739,7 @@ fun HomeScreen() {
                             enabled = !checking
                         ) { scope.launch { loadWaiting() } }
                         if (waiting.size > 1) {
-                            PxButton("Save all", Modifier.weight(1f), icon = PixelData.ICON_DOWN) {
+                            PxButton("Save all", Modifier.weight(1f), icon = Ic.RECEIVE) {
                                 waiting.toList().forEach { saveItem(it) }
                             }
                         }
@@ -646,7 +753,7 @@ fun HomeScreen() {
                                     size = 14.sp,
                                     weight = FontWeight.SemiBold,
                                     align = TextAlign.Center,
-                                    color = if (waitingMsg.startsWith("Can't")) RedErr else Cream
+                                    color = if (waitingMsg.startsWith("Can't") || waitingMsg.startsWith("The laptop") || waitingMsg.startsWith("Pindrop is")) RedErr else Cream
                                 )
                                 Spacer(Modifier.height(4.dp))
                                 Body(
@@ -665,7 +772,7 @@ fun HomeScreen() {
                                     .padding(vertical = 8.dp),
                                 verticalAlignment = Alignment.CenterVertically
                             ) {
-                                PxIcon(PixelData.ICON_DOC, Orange, 2.dp)
+                                IconView(Ic.DOC, Orange, 22.dp)
                                 Spacer(Modifier.width(12.dp))
                                 Column(Modifier.weight(1f)) {
                                     Body(item.name, size = 14.sp, weight = FontWeight.SemiBold, maxLines = 1)
@@ -681,7 +788,7 @@ fun HomeScreen() {
             Spacer(Modifier.height(14.dp))
 
             // no shared Wi-Fi
-            PixelCard("No Wi-Fi? Send directly", PixelData.ICON_QR) {
+            PixelCard("No Wi-Fi? Send directly", Ic.QR) {
                 if (hotOn) {
                     val q = hotQr
                     if (q != null) {
@@ -711,12 +818,13 @@ fun HomeScreen() {
                     )
                     Spacer(Modifier.height(6.dp))
                     Body(
-                        "Both phones need Pindrop open. Location must be on. The other phone leaves the internet for a moment.",
+                        "Both phones need Pindrop open. Location must be on. The other phone leaves the internet for a moment. " +
+                            "The code only works for this one transfer.",
                         size = 12.sp,
                         color = Muted
                     )
                     Spacer(Modifier.height(12.dp))
-                    PxButton("Choose files and start", Modifier.fillMaxWidth(), icon = PixelData.ICON_UP) {
+                    PxButton("Choose files and start", Modifier.fillMaxWidth(), icon = Ic.SEND) {
                         hotMsg = ""
                         hotPicker.launch(arrayOf("*/*"))
                     }
@@ -735,7 +843,7 @@ fun HomeScreen() {
             Spacer(Modifier.height(14.dp))
 
             // phones
-            PixelCard("Phones", PixelData.ICON_PHONE) {
+            PixelCard("Phones", Ic.PHONE) {
                 if (qr != null) {
                     Box(Modifier.fillMaxWidth(), contentAlignment = Alignment.Center) {
                         QrView(qr, 200.dp)
@@ -767,7 +875,7 @@ fun HomeScreen() {
                 }
                 Spacer(Modifier.height(14.dp))
                 Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                    PxButton("Scan a code", Modifier.weight(1f), icon = PixelData.ICON_QR) {
+                    PxButton("Scan a code", Modifier.weight(1f), icon = Ic.QR) {
                         scanner.launch(
                             ScanOptions().apply {
                                 setDesiredBarcodeFormats(ScanOptions.QR_CODE)
@@ -793,7 +901,7 @@ fun HomeScreen() {
                     PxButton(
                         "Copy my code",
                         Modifier.fillMaxWidth(),
-                        icon = PixelData.ICON_COPY,
+                        icon = Ic.COPY,
                         filled = false,
                         enabled = qr != null
                     ) {
@@ -804,7 +912,7 @@ fun HomeScreen() {
                         }
                     }
                     Spacer(Modifier.height(10.dp))
-                    DashedBox {
+                    FieldBox {
                         BasicTextField(
                             value = pasted,
                             onValueChange = { pasted = it },
@@ -837,14 +945,13 @@ fun HomeScreen() {
                 if (joined) {
                     Spacer(Modifier.height(10.dp))
                     PxButton("Disconnect", Modifier.fillMaxWidth(), filled = false) {
-                        Hotspot.leave()
-                        joined = false
+                        endJoin()
                         pairMsg = "Disconnected."
                     }
                 }
                 Spacer(Modifier.height(16.dp))
-                Body("Paired phones", size = 12.sp, color = Muted)
-                Spacer(Modifier.height(6.dp))
+                Label("Paired phones", color = Muted)
+                Spacer(Modifier.height(8.dp))
                 if (peers.isEmpty()) {
                     DashedBox {
                         Body(
@@ -863,7 +970,7 @@ fun HomeScreen() {
                                 .padding(vertical = 8.dp),
                             verticalAlignment = Alignment.CenterVertically
                         ) {
-                            PxIcon(PixelData.ICON_PHONE, Orange, 2.dp)
+                            IconView(Ic.PHONE, Orange, 22.dp)
                             Spacer(Modifier.width(12.dp))
                             Column(Modifier.weight(1f)) {
                                 Body(p.name, size = 14.sp, weight = FontWeight.SemiBold, maxLines = 1)
@@ -886,7 +993,7 @@ fun HomeScreen() {
             Spacer(Modifier.height(14.dp))
 
             // activity
-            PixelCard("Activity", PixelData.ICON_DOC) {
+            FoldCard("Activity", Ic.DOC, activityOpen, { activityOpen = !activityOpen }) {
                 if (transfers.isEmpty()) {
                     DashedBox {
                         Column(Modifier.fillMaxWidth(), horizontalAlignment = Alignment.CenterHorizontally) {
@@ -903,6 +1010,38 @@ fun HomeScreen() {
                 } else {
                     transfers.forEach { t -> ActivityRow(t) }
                 }
+            }
+            Spacer(Modifier.height(14.dp))
+
+            // settings
+            FoldCard("Settings", Ic.LOCK, settingsOpen, { settingsOpen = !settingsOpen }) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Column(Modifier.weight(1f)) {
+                        Body("Keep working in the background", size = 14.sp, weight = FontWeight.SemiBold)
+                        Body(
+                            "Shows a small notification so files keep moving with the screen off.",
+                            size = 12.sp,
+                            color = Muted
+                        )
+                    }
+                    Spacer(Modifier.width(10.dp))
+                    PxButton(if (background) "On" else "Off", compact = true, filled = background) {
+                        background = !background
+                        Prefs.setBackground(ctx, background)
+                    }
+                }
+                Spacer(Modifier.height(16.dp))
+                PxButton("Make a new phone code", Modifier.fillMaxWidth(), icon = Ic.LOCK, filled = false) {
+                    Prefs.resetKey(ctx)
+                    qrTick++
+                    pairMsg = "New code made. Phones paired before must scan it again to send to this phone."
+                }
+                Spacer(Modifier.height(8.dp))
+                Body(
+                    "Use this if someone else may have seen your code. Old pairings stop working for sending to this phone.",
+                    size = 12.sp,
+                    color = Muted
+                )
             }
             Spacer(Modifier.height(18.dp))
             Body(
@@ -927,7 +1066,7 @@ fun ActivityRow(t: Transfer) {
             .padding(vertical = 8.dp),
         verticalAlignment = Alignment.CenterVertically
     ) {
-        PxIcon(PixelData.ICON_DOC, if (failed) RedErr else Orange, 2.dp)
+        IconView(Ic.DOC, if (failed) RedErr else Orange, 22.dp)
         Spacer(Modifier.width(12.dp))
         Column(Modifier.weight(1f)) {
             Body(t.name, size = 14.sp, weight = FontWeight.SemiBold, maxLines = 1)

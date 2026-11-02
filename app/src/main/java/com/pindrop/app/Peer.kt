@@ -16,12 +16,37 @@ data class Peer(val name: String, val host: String, val port: Int, val key: Stri
 object Peers {
     fun myName(): String = (Build.MODEL ?: "Android phone").take(30)
 
+    /** True for a key that is 32 valid bytes. Anything else could crash the app later, so it is never kept. */
+    fun goodKey(k: String): Boolean = try {
+        Secure.unb64(k).size == 32
+    } catch (e: Exception) {
+        false
+    }
+
+    /** Only addresses on a home, hotspot or office network (never the open internet). */
+    fun privateHost(h: String): Boolean {
+        val m = Regex("^(\\d{1,3})\\.(\\d{1,3})\\.(\\d{1,3})\\.(\\d{1,3})$").find(h) ?: return false
+        val p = m.groupValues.drop(1).map { it.toInt() }
+        if (p.any { it > 255 }) return false
+        return p[0] == 10 || (p[0] == 192 && p[1] == 168) || (p[0] == 172 && p[1] in 16..31)
+    }
+
+    private fun tidyName(n: String): String {
+        val c = n.filter { !it.isISOControl() && it != '<' && it != '>' }.trim().take(30)
+        return if (c.isEmpty()) "Phone" else c
+    }
+
     fun list(c: Context): List<Peer> {
         return try {
             val arr = JSONArray(Prefs.getPeersJson(c))
-            (0 until arr.length()).map { i ->
-                val o = arr.getJSONObject(i)
-                Peer(o.getString("n"), o.getString("h"), o.getInt("p"), o.getString("k"))
+            (0 until arr.length()).mapNotNull { i ->
+                try {
+                    val o = arr.getJSONObject(i)
+                    val p = Peer(tidyName(o.getString("n")), o.getString("h"), o.getInt("p"), o.getString("k"))
+                    if (goodKey(p.key) && p.port in 1..65535) p else null
+                } catch (e: Exception) {
+                    null
+                }
             }
         } catch (e: Exception) {
             emptyList()
@@ -35,7 +60,10 @@ object Peers {
     }
 
     /** Adds a phone, or refreshes its address if we already know it. */
-    fun add(c: Context, p: Peer) = save(c, list(c).filter { it.key != p.key } + p)
+    fun add(c: Context, p: Peer) {
+        if (!goodKey(p.key) || p.port !in 1..65535) return
+        save(c, list(c).filter { it.key != p.key } + p.copy(name = tidyName(p.name)))
+    }
 
     fun remove(c: Context, p: Peer) = save(c, list(c).filter { it.key != p.key })
 
@@ -51,8 +79,8 @@ object Peers {
             val h = u.getQueryParameter("h") ?: return null
             val p = u.getQueryParameter("p")?.toIntOrNull() ?: return null
             val k = u.getQueryParameter("k") ?: return null
-            if (Secure.unb64(k).size != 32) return null
-            Peer(u.getQueryParameter("n") ?: "Phone", h, p, k)
+            if (!goodKey(k) || p !in 1..65535 || !privateHost(h)) return null
+            Peer(tidyName(u.getQueryParameter("n") ?: "Phone"), h, p, k)
         } catch (e: Exception) {
             null
         }
@@ -93,12 +121,21 @@ object PhoneServer {
     @Volatile
     var hotMode = false
 
+    /**
+     * A throw-away key for one "no Wi-Fi" session. While it is set, only this key is accepted, so the
+     * permanent key never travels in a temporary-Wi-Fi code.
+     */
+    @Volatile
+    var session: ByteArray? = null
+
     /** The phone that last joined during hotMode. */
     @Volatile
     var lastHot: Peer? = null
 
     private val server = PeerServer(object : PeerServer.Host {
         override fun key(): ByteArray = Prefs.getKey(app!!)
+
+        override fun sessionKey(): ByteArray? = session
 
         override fun deviceName(): String = Peers.myName()
 
@@ -116,7 +153,7 @@ object PhoneServer {
 
         override fun paired(name: String, host: String, port: Int, keyB64: String) {
             val p = Peer(name, host, port, keyB64)
-            if (hotMode) {
+            if (session != null) {
                 // joined our temporary Wi-Fi: use it now, don't save it
                 lastHot = p
                 listener?.invoke("hot", name, 0)

@@ -11,20 +11,34 @@ android {
         applicationId = "com.pindrop.app"
         minSdk = 29
         targetSdk = 34
-        versionCode = 2
-        versionName = "2.0"
+        versionCode = 3
+        versionName = "3.0"
+    }
+
+    // One fixed signing key, stored in the project. Every build is signed the same way, so a new APK
+    // installs OVER the old one and keeps your pairings. (Keep this repository private.)
+    signingConfigs {
+        create("pindrop") {
+            storeFile = file("pindrop.jks")
+            storeType = "pkcs12"
+            storePassword = "pindrop-app"
+            keyAlias = "pindrop"
+            keyPassword = "pindrop-app"
+        }
     }
 
     buildTypes {
         // The GitHub build makes the "debug" APK. Normally that one is slow and jerky.
         // These settings make it a fast, smaller build while keeping the same install steps.
         debug {
+            signingConfig = signingConfigs.getByName("pindrop")
             isDebuggable = false
             isMinifyEnabled = true
             isShrinkResources = true
             proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
         }
         release {
+            signingConfig = signingConfigs.getByName("pindrop")
             isMinifyEnabled = false
         }
     }
@@ -61,6 +75,7 @@ dependencies {
     implementation("androidx.compose.ui:ui")
     implementation("androidx.compose.ui:ui-graphics")
     implementation("androidx.compose.foundation:foundation")
+    implementation("androidx.compose.animation:animation")
     implementation("androidx.compose.material3:material3")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1")
     implementation("com.journeyapps:zxing-android-embedded:4.3.0")

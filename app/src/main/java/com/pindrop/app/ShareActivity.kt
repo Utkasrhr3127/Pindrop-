@@ -90,6 +90,7 @@ fun ShareSheet(uris: List<Uri>, onClose: () -> Unit) {
         doneCount = 0
         currentFraction = 0f
         if (uris.isEmpty()) return@LaunchedEffect
+        TransferService.hold(ctx)
         try {
             withContext(Dispatchers.IO) {
                 for ((i, uri) in uris.withIndex()) {
@@ -97,7 +98,7 @@ fun ShareSheet(uris: List<Uri>, onClose: () -> Unit) {
                     currentName = info.name
                     currentFraction = 0f
                     try {
-                        Net.upload(target.addr, info, target.key) { sent ->
+                        Net.upload(target.addr, info, target.key, code = target.code) { sent ->
                             currentFraction = if (info.size > 0) sent.toFloat() / info.size.toFloat() else 0f
                         }
                     } finally {
@@ -113,6 +114,8 @@ fun ShareSheet(uris: List<Uri>, onClose: () -> Unit) {
             throw e
         } catch (e: Exception) {
             error = Net.friendly(e, whoName(target))
+        } finally {
+            TransferService.release(ctx)
         }
     }
 
@@ -167,12 +170,13 @@ fun ShareSheet(uris: List<Uri>, onClose: () -> Unit) {
             Spacer(Modifier.height(10.dp))
             Mascot(mood, width = 140.dp)
             Spacer(Modifier.height(4.dp))
-            Px(
+            Body(
                 title,
                 size = 22.sp,
-                bold = true,
+                weight = FontWeight.SemiBold,
                 color = if (shownError != null) RedErr else Cream,
-                align = TextAlign.Center
+                align = TextAlign.Center,
+                spacing = 0.sp
             )
             Spacer(Modifier.height(6.dp))
             Body(sub, size = 13.sp, color = Muted, align = TextAlign.Center, maxLines = 3)
@@ -183,7 +187,7 @@ fun ShareSheet(uris: List<Uri>, onClose: () -> Unit) {
                     PxButton(
                         t.name,
                         Modifier.fillMaxWidth(),
-                        icon = if (t.key == null) PixelData.ICON_LAPTOP else PixelData.ICON_PHONE
+                        icon = if (t.key == null) Ic.LAPTOP else Ic.PHONE
                     ) { chosen = t }
                     Spacer(Modifier.height(10.dp))
                 }

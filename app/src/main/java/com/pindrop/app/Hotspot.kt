@@ -120,7 +120,7 @@ object Hotspot {
         val security = if (wpa3) "wpa3" else "wpa2"
         return "pindrop://pair?h=" + ip +
             "&p=" + port +
-            "&k=" + Secure.b64(Prefs.getKey(ctx)) +
+            "&k=" + Secure.b64(PhoneServer.session ?: throw IllegalStateException("no session key")) +
             "&n=" + Uri.encode(Peers.myName().take(16)) +
             "&s=" + Uri.encode(ssid) +
             "&w=" + Uri.encode(pass) +
